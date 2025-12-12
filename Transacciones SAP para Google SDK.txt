@@ -1,0 +1,111 @@
+Transacciones SAP para Google SDK
+
+- SPRO (Configuraciones SDK)
+- STRUST (Certificados SAP)
+- SSFA (Certificados SAP)
+- SM66 (Ver procesos SAP)
+- SM50 (Ver procesos SAP)
+- SM51 (Ver procesos SAP)
+- SM59 (crear, verificar RFCs API Google)
+- SE01 (solo en ambiente DEV, verificar OT creada, liberarla en caso de ser requerido).
+- STMS (Visualizar cola, privilegios permitir IMPORT de OT externa, realizar transporte en cada ambiente).
+- ST22 (Ver DUMPs)
+- SM21 (Ver Errores)
+- SE16 (Solo en ambiente DEV, se debe editar contenido la tabla SSFAPPLIC (certificados))
+- CG3Y (bajar archivos)
+- CG3Z (subir archivos)
+- AL11 (ver logs)
+
+Una vez instalado el ABAP SDK for Google se crearan las siguientes transacciones las cuales deben ser asignadas al usuario asignado para realizar la configuracion, ideal crear un ROL con ellas y asignarlas al usaurio post instalacion de SDK. seran requeridas para la configuracion.
+
+TRANSACCION		DESCRIPCION
+/GOOG/08000003       IMG Activity /GOOG/CNF_CKEY
+/GOOG/08000004       IMG Activity /GOOG/CNF_SMAP
+/GOOG/08000005       IMG Activity /GOOG/CNF_PARAM
+/GOOG/08000006       IMG Activity /GOOG/CNF_LOG
+/GOOG/08000011       IMG Activity /GOOG/CACHE_CLR
+/GOOG/08000012       IMG Activity /GOOG/APIKEY_MAINT
+/GOOG/08000013       IMG Activity /GOOG/GET_VERSION
+/GOOG/08000014       IMG Activity /GOOG/DEMO_DOCAI
+/GOOG/08000015       IMG Activity /GOOG/DEMO_PUBSUB
+/GOOG/08000016       IMG Activity /GOOG/DEMO_TRANSLATE
+/GOOG/08000017       IMG Activity /GOOG/DEMO_STORAGE
+/GOOG/08000018       IMG Activity /GOOG/DEMO_SCRTMGR
+/GOOG/08000019       IMG Activity /GOOG/VAL_AUTH_CNF
+/GOOG/08000020       IMG Activity /GOOG/VAL_API_RET_SM
+/GOOG/08000021       IMG Activity /GOOG/RFC_INFO
+/GOOG/08000022       IMG Activity /GOOG/CODE_GEN
+/GOOG/73000001       IMG Activity /GOOG/ROLE_FINDER
+/GOOG/73000002       IMG Activity /GOOG/CNF_AICONFIG
+/GOOG/73000003       IMG Activity /GOOG/CNF_SEARHCONFG
+/GOOG/73000004       IMG Activity /GOOG/CNF_AIRFC
+/GOOG/73000005       IMG Activity /GOOG/CNF_FSSYNC
+/GOOG/73000006       IMG Activity /GOOG/DEMO_FEATUREST
+/GOOG/73000007       IMG Activity /GOOG/DEMO_AI_STUDIO
+/GOOG/73000008       IMG Activity /GOOG/DEMO_EMBEDDING
+/GOOG/73000009       IMG Activity /GOOG/DEMO_GEN_MODEL
+/GOOG/73000010       IMG Activity /GOOG/DEMO_VECTOR_SH
+/GOOG/73000011       IMG Activity /GOOG/CNF_BQSETT
+/GOOG/73000012       IMG Activity /GOOG/CNF_BQSETTDISP
+/GOOG/73000013       IMG Activity /GOOG/GET_METADATA
+/GOOG/73000014       IMG Activity /GOOG/DEMO_FCM
+/GOOG/73000015       IMG Activity /GOOG/DEMO_FIRESTORE
+/GOOG/73000016       IMG Activity /GOOG/CNF_CONT_REPO
+/GOOG/73000017       IMG Activity /GOOG/CNF_CLOUDEVTS
+/GOOG/73000018       IMG Activity /GOOG/CNF_EVTROUTER
+/GOOG/73000019       IMG Activity /GOOG/CNF_IDOCMAP
+/GOOG/73000020       IMG Activity /GOOG/CNF_BO_EVT_MAP
+/GOOG/AI_RFCINFO     Get RFC parameters for Search
+/GOOG/APIKEY_MAINT   ABAP SDK for Google-Maintain API Key
+/GOOG/APIKEY_RET_SM  ABAP SDK for Google - Retrieve SMKey
+/GOOG/BQTR_SETT_DISP BQ Data Transfer: Settings Display
+/GOOG/BQTR_SETTINGS  BQ Data Transfer: Settings Maintain
+/GOOG/CE_DEFAULT     Configure Defaults for Cloud Events
+/GOOG/CHECK_AUTH_CNF ABAP SDK for Google - Check Auth Cnf
+/GOOG/CLEAR_CACHE    ABAP SDK for Google - Clear Cache
+/GOOG/CODE_WIZARD    ABAP SDK for Google - Low Code Gen.
+/GOOG/DEMO_DOCAI     ABAP SDK for Google - Demo DocAI
+/GOOG/DEMO_EMBEDDING Invoke Embedding Models
+/GOOG/DEMO_FCM       ABAP SDK for Google - Demo FCM
+/GOOG/DEMO_FEATUREST ABAP SDK for Google:Demo Feature Str
+/GOOG/DEMO_FIRESTORE Demo Program: Firestore
+/GOOG/DEMO_GEN_MODEL Invoke Generative Models
+/GOOG/DEMO_GEN_PROTO Demo program: Prototype with Gemini
+/GOOG/DEMO_PUBSUB    ABAP SDK for Google - Demo PubSub
+/GOOG/DEMO_SECRETMGR ABAP SDK for Google - Demo SecretMgr
+/GOOG/DEMO_STORAGE   ABAP SDK for Google - Demo Storage
+/GOOG/DEMO_TRANSLATE ABAP SDK for Google - Demo Translate
+/GOOG/DEMO_VECTOR_SH Manage and invoke Vector Search
+/GOOG/EVENT_ROUTER   Configure GCP Targets for an Event
+/GOOG/GET_METADATA   Get VM instance metadata attributes
+/GOOG/GET_VERSION    ABAP SDK for Google - Get Version
+/GOOG/IDOC_MAP       Configure Defaults for Cloud Events
+/GOOG/RFC_INFO       ABAP SDK for Google Cloud: RFC Info
+/GOOG/ROLE_FINDER    Find API Specific IAM Roles
+/GOOG/SDK_IMG        ABAP SDK for Google Cloud
+/GOOG/SYNC_FEATUREST Sync Feature Store
+
+
+-- Transacciones para replicacion desde la RSA1
+- SM37                                  Revision y Monitoreo de Jobs
+- SE10                                  Gestion de Solicitud de Transporte
+- SE11                                  Revision de CDS Views creadas - Diccionario ABAP
+- SE16                                  Revision de Tablas - Explorador de Datos
+- SE16N                                 Conteo de registros de Tablas o Vistas ABAP CDS - Herramienta General de Visualizacion de Datos
+- BD54                                  Definicion Sistema Logico BQCLNT[Numero Mandante]
+- SMICM                                 Ping Urls *googleapis.com - Monitoreo de Gestion de Comunicacion de Internet (ICM)
+- UCONCOCKPIT                           White List *googleapis.com - Cockpit de Gestion de Conectividad HTTP/HTTPS 
+- ODQMON                                
+- RSA1
+    BI Content                          Replicacion de contenido BI (Chequear que este instalado)
+    0REQTSN                             
+    Source System                       
+    ODP_CDS                             ODP - Vistas ABAP CDS Agregar Sistema Logico BQCLNT[Numero Mandante]
+- SE38 
+    ZGOOG_R_BQTR_GEN_MASS_CDS_VIEW      Generacion de CDS Views
+    ZGOOG_R_BQTR_GEN_REPL_OBJECTS       Generacion de Artefactos Bw
+    ZGOOG_R_BQTR_DEMO_DYN_LOAD          Carga dinamica de Artefactos (Testeo de configuracion Data Transfer)
+- RSDTP
+- DHCDCMON
+- RZ20
+- SU01D
