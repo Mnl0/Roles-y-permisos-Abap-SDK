@@ -1678,8 +1678,9 @@ CLASS lcl_auditor IMPLEMENTATION.
     IF lv_cmt_pos >= 0.
       DATA(lv_raw_c) = COND string( WHEN lv_cmt_pos > 0
                                     THEN iv_line(lv_cmt_pos) ELSE '' ).
+      DATA(lv_raw_m) = substring( val = iv_line off = lv_cmt_pos ).
       ev_code = trim_spaces( lv_raw_c ).
-      ev_cmt  = trim_spaces( iv_line+lv_cmt_pos ).
+      ev_cmt  = trim_spaces( lv_raw_m ).
     ELSE.
       ev_code = trim_spaces( iv_line ).
     ENDIF.
@@ -2062,7 +2063,8 @@ CLASS lcl_auditor IMPLEMENTATION.
       " Detectar si es anotación '@' (incluso si traía coma inicial ', @Semantics...')
       DATA(lv_chk_ann) = lv_bcode.
       IF lv_p_run = 0 AND strlen( lv_chk_ann ) > 0 AND lv_chk_ann(1) = ','.
-        lv_chk_ann = trim_spaces( lv_chk_ann+1 ).
+        DATA(lv_tmp_ann) = substring( val = lv_chk_ann off = 1 ).
+        lv_chk_ann = trim_spaces( lv_tmp_ann ).
       ENDIF.
 
       IF strlen( lv_chk_ann ) > 0 AND lv_chk_ann(1) = '@'.
@@ -2324,7 +2326,8 @@ CLASS lcl_auditor IMPLEMENTATION.
       IF lv_pdepth = 0 AND lv_cdepth = 0.
         WHILE strlen( <fs_st>-code_clean ) > 0 AND <fs_st>-code_clean(1) = ','.
           <fs_st>-had_lead_c = abap_true.
-          <fs_st>-code_clean = trim_spaces( <fs_st>-code_clean+1 ).
+          DATA(lv_tmp_lead)  = substring( val = <fs_st>-code_clean off = 1 ).
+          <fs_st>-code_clean = trim_spaces( lv_tmp_lead ).
         ENDWHILE.
       ENDIF.
 
@@ -2347,9 +2350,12 @@ CLASS lcl_auditor IMPLEMENTATION.
           DATA(lv_lpos) = strlen( <fs_st>-code_clean ) - 1.
           IF <fs_st>-code_clean+lv_lpos(1) = ','.
             <fs_st>-had_trail_c = abap_true.
-            <fs_st>-code_clean  = COND string(
-              WHEN lv_lpos > 0 THEN trim_spaces( <fs_st>-code_clean(lv_lpos) )
-              ELSE '' ).
+            IF lv_lpos > 0.
+              DATA(lv_tmp_trl)   = substring( val = <fs_st>-code_clean len = lv_lpos ).
+              <fs_st>-code_clean = trim_spaces( lv_tmp_trl ).
+            ELSE.
+              <fs_st>-code_clean = ''.
+            ENDIF.
           ELSE.
             EXIT.
           ENDIF.
