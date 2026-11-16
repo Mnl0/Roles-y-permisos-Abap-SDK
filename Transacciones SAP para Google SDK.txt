@@ -95,7 +95,8 @@ TRANSACCION		DESCRIPCION
 - BD54                                  Definicion Sistema Logico BQCLNT[Numero Mandante]
 - SMICM                                 Ping Urls *googleapis.com - Monitoreo de Gestion de Comunicacion de Internet (ICM)
 - UCONCOCKPIT                           White List *googleapis.com - Cockpit de Gestion de Conectividad HTTP/HTTPS 
-- ODQMON                                
+- ODQMON
+- DHCDCMON                                
 - RSA1
     BI Content                          Replicacion de contenido BI (Chequear que este instalado)
     0REQTSN                             
@@ -106,6 +107,10 @@ TRANSACCION		DESCRIPCION
     ZGOOG_R_BQTR_GEN_REPL_OBJECTS       Generacion de Artefactos Bw
     ZGOOG_R_BQTR_DEMO_DYN_LOAD          Carga dinamica de Artefactos (Testeo de configuracion Data Transfer)
 - RSDTP
-- DHCDCMON
 - RZ20
 - SU01D
+- SM60 
+- SM66
+- SM50
+- SM59
+- RSPC
