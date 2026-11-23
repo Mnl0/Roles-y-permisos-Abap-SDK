@@ -4,21 +4,25 @@
 *& Utilidad Unificada post-generación BigQuery Toolkit (ABAP SDK GCP)
 *& Propósito:
 *&   1) Auditar masivamente (~150+ tablas) en modo solo lectura:
-*&      - Columnas RAW / LRAW / RAWSTRING -> bintohex( ) o excluir
-*&      - Columnas DF34_RAW / DF16_RAW    -> cast a abap.dec o excluir
+*&      - Compatibility Views (DD02L-VIEWREF / Proxy SE16N, ej. MARC ->
+*&        NSDM_V_MARC -> nsdm_e_marc) + Código SELECT FROM de reemplazo
+*&      - Columnas RAW / LRAW / RAWSTRING -> bintohex( ) o comentar
+*&      - Columnas DF34_RAW / DF16_RAW    -> comentar automáticamente
 *&      - Columnas QUAN y CURR            -> Ref. SE11 (REFTABLE/REFFIELD),
 *&                                           claves JOIN o CAST abap.dec
 *&      - Columna de Mandante (CLNT)      -> Nombre exacto o "NO TIENE"
 *&      - Objetos tipo VIEW (ej. BPVG)    -> Alerta + Tablas físicas base
 *&   2) Modificar y activar automáticamente (individual o masivo) las
-*&      vistas CDS de tablas TRANSPARENTES aplicando el código sugerido,
-*&      reutilizando la OT abierta sin volver a pedir OT vista por vista.
+*&      vistas CDS de tablas TRANSPARENTES aplicando el código sugerido
+*&      (reemplazo opcional de Compatibility View, bintohex RAW, cast de
+*&      QUAN/CURR y comentario automático de DF34_RAW/DF16_RAW), usando
+*&      la OT abierta sin volver a pedir transporte vista por vista.
 *&
 *& Interactividad en el reporte ALV (Doble Clic):
-*&   - Tabla / Tabla Ref.     -> Abre la tabla en la SE11
-*&   - Vista CDS / Código CDS -> Muestra vista previa del código sugerido
-*&   - Est. CDS / Acción CDS  -> Permite Guardar y Activar esa vista CDS
-*&                               puntual desde el mismo ALV (tablas TRANSP)
+*&   - Tabla / Tabla Ref. / Objeto Proxy -> Abre el objeto en la SE11
+*&   - Entidad Reemplazo (ej. NSDM_E_*)  -> Muestra DDL estándar de SAP
+*&   - Vista CDS / Código CDS / Reempl.  -> Muestra vista previa sugerida
+*&   - Est. CDS / Acción CDS             -> Guarda y Activa esa vista CDS
 *&---------------------------------------------------------------------*
 REPORT zgen_auditoria_cds_bq.
 
@@ -36,6 +40,10 @@ TYPES:
   BEGIN OF ty_detail,
     tabname        TYPE dd02l-tabname,
     ddtext         TYPE dd02t-ddtext,
+    es_compat      TYPE c LENGTH 16,
+    proxy_obj      TYPE dd02l-viewref,
+    cds_target     TYPE c LENGTH 30,
+    codigo_repl    TYPE c LENGTH 130,
     cds_view       TYPE ddddlsrc-ddlname,
     estado_cds     TYPE c LENGTH 16,
     tiene_mandt    TYPE c LENGTH 15,
@@ -51,7 +59,7 @@ TYPES:
     reffield       TYPE dd03l-reffield,
     ubicacion_ref  TYPE c LENGTH 32,
     claves_ref     TYPE c LENGTH 80,
-    sugerencia_cds TYPE c LENGTH 120,
+    sugerencia_cds TYPE c LENGTH 130,
     nota_tecnica   TYPE c LENGTH 160,
     t_color        TYPE lvc_t_scol,
   END OF ty_detail,
@@ -60,6 +68,10 @@ TYPES:
     tabname     TYPE dd02l-tabname,
     ddtext      TYPE dd02t-ddtext,
     estado_tab  TYPE c LENGTH 18,
+    es_compat   TYPE c LENGTH 16,
+    proxy_obj   TYPE dd02l-viewref,
+    cds_target  TYPE c LENGTH 30,
+    codigo_repl TYPE c LENGTH 130,
     cds_view    TYPE ddddlsrc-ddlname,
     estado_cds  TYPE c LENGTH 16,
     tiene_mandt TYPE c LENGTH 15,
@@ -82,6 +94,7 @@ TYPES:
     as4vers  TYPE dd02l-as4vers,
     tabclass TYPE dd02l-tabclass,
     clidep   TYPE dd02l-clidep,
+    viewref  TYPE dd02l-viewref,
   END OF ty_dd02l,
 
   BEGIN OF ty_dd02t,
@@ -107,15 +120,43 @@ TYPES:
     reffield  TYPE dd03l-reffield,
   END OF ty_dd03l,
 
+  BEGIN OF ty_compat_map,
+    tabname    TYPE dd02l-tabname,
+    tabclass   TYPE dd02l-tabclass,
+    proxy_obj  TYPE dd02l-viewref,
+    cds_target TYPE c LENGTH 30,
+  END OF ty_compat_map,
+
   BEGIN OF ty_cds_map,
     tabname    TYPE dd02l-tabname,
     ddlname    TYPE ddddlsrc-ddlname,
+    from_obj   TYPE c LENGTH 30,
+    prio       TYPE i,
     estado_cds TYPE c LENGTH 16,
   END OF ty_cds_map,
 
   BEGIN OF ty_tab_key,
     tabname TYPE dd02l-tabname,
   END OF ty_tab_key,
+
+  BEGIN OF ty_dep_obj_key,
+    objectname TYPE ddldependency-objectname,
+  END OF ty_dep_obj_key,
+
+  BEGIN OF ty_dep_ddl_key,
+    ddlname TYPE ddldependency-ddlname,
+  END OF ty_dep_ddl_key,
+
+  BEGIN OF ty_viewref_key,
+    viewref TYPE dd02l-viewref,
+  END OF ty_viewref_key,
+
+  BEGIN OF ty_ddl_dep,
+    ddlname    TYPE ddldependency-ddlname,
+    objectname TYPE ddldependency-objectname,
+    state      TYPE ddldependency-state,
+    objecttype TYPE ddldependency-objecttype,
+  END OF ty_ddl_dep,
 
   BEGIN OF ty_ref_key,
     tabname   TYPE dd03l-tabname,
@@ -144,6 +185,7 @@ DATA: gt_detail  TYPE STANDARD TABLE OF ty_detail,
       gt_summary TYPE STANDARD TABLE OF ty_summary,
       gt_dd02l   TYPE STANDARD TABLE OF ty_dd02l,
       gt_dd03l   TYPE STANDARD TABLE OF ty_dd03l,
+      gt_compat  TYPE STANDARD TABLE OF ty_compat_map,
       go_salv    TYPE REF TO cl_salv_table,
       gv_trkorr  TYPE trkorr.
 
@@ -203,6 +245,11 @@ SELECTION-SCREEN BEGIN OF BLOCK b4 WITH FRAME TITLE txt_b4.
   SELECTION-SCREEN SKIP 1.
 
   SELECTION-SCREEN BEGIN OF LINE.
+    PARAMETERS: p_comp AS CHECKBOX DEFAULT 'X'.
+    SELECTION-SCREEN COMMENT 4(72) c_comp FOR FIELD p_comp.
+  SELECTION-SCREEN END OF LINE.
+
+  SELECTION-SCREEN BEGIN OF LINE.
     PARAMETERS: p_actin AS CHECKBOX DEFAULT 'X'.
     SELECTION-SCREEN COMMENT 4(72) c_actin FOR FIELD p_actin.
   SELECTION-SCREEN END OF LINE.
@@ -241,13 +288,23 @@ CLASS lcl_auditor DEFINITION FINAL.
       get_default_tables
         RETURNING VALUE(rt_tabs) TYPE tt_tab_key,
 
-      load_cds_mapping
-        IMPORTING it_valid_tabs TYPE tt_tab_key
-        EXPORTING et_cds_map    TYPE tt_cds_map,
+      strip_ddl_comments_for_tokens
+        IMPORTING iv_source        TYPE string
+        RETURNING VALUE(rv_tokens) TYPE string,
 
       extract_from_table_in_ddl
         IMPORTING iv_source         TYPE string
         RETURNING VALUE(rv_tabname) TYPE dd02l-tabname,
+
+      extract_defined_entity_in_ddl
+        IMPORTING iv_source        TYPE string
+        RETURNING VALUE(rv_entity) TYPE dd02l-tabname,
+
+      load_compat_mapping,
+
+      load_cds_mapping
+        IMPORTING it_valid_tabs TYPE tt_tab_key
+        EXPORTING et_cds_map    TYPE tt_cds_map,
 
       clean_alias
         IMPORTING iv_fieldname    TYPE clike
@@ -277,7 +334,11 @@ CLASS lcl_auditor DEFINITION FINAL.
                   iv_l    TYPE scrtext_l,
 
       open_se11_table
-        IMPORTING iv_tabname TYPE dd02l-tabname,
+        IMPORTING iv_tabname TYPE clike,
+
+      preview_std_cds_target
+        IMPORTING iv_cds_target TYPE clike
+                  iv_proxy_obj  TYPE clike,
 
       trim_spaces
         IMPORTING iv_str        TYPE string
@@ -300,6 +361,13 @@ CLASS lcl_auditor DEFINITION FINAL.
                   ev_brack_delta TYPE i
                   ev_case_delta  TYPE i,
 
+      rewrite_compat_from_clause
+        IMPORTING iv_tabname    TYPE dd02l-tabname
+                  iv_proxy_obj  TYPE dd02l-viewref
+                  iv_cds_target TYPE clike
+        CHANGING  ct_prefix     TYPE tt_string_list
+                  cv_compat_chg TYPE abap_bool,
+
       build_modified_cds_source
         IMPORTING iv_source     TYPE string
                   iv_tabname    TYPE dd02l-tabname
@@ -307,7 +375,8 @@ CLASS lcl_auditor DEFINITION FINAL.
                   ev_new_source TYPE string
                   ev_changed    TYPE abap_bool
                   ev_change_cnt TYPE i
-                  ev_comma_cnt  TYPE i,
+                  ev_comma_cnt  TYPE i
+                  ev_compat_chg TYPE abap_bool,
 
       preview_cds_code
         IMPORTING iv_ddlname TYPE ddddlsrc-ddlname
@@ -323,13 +392,15 @@ CLASS lcl_auditor DEFINITION FINAL.
                   ev_accion_msg  TYPE string
                   ev_color_col   TYPE i
                   ev_updated     TYPE abap_bool
+                  ev_compat_done TYPE abap_bool
         CHANGING  cv_trkorr      TYPE trkorr,
 
       update_alv_rows_for_table
-        IMPORTING iv_tabname    TYPE dd02l-tabname
-                  iv_estado_cds TYPE string
-                  iv_accion_msg TYPE string
-                  iv_color_col  TYPE i,
+        IMPORTING iv_tabname     TYPE dd02l-tabname
+                  iv_estado_cds  TYPE string
+                  iv_accion_msg  TYPE string
+                  iv_color_col   TYPE i
+                  iv_compat_done TYPE abap_bool DEFAULT abap_false,
 
       execute_mass_cds_update,
 
@@ -445,10 +516,10 @@ CLASS lcl_auditor IMPLEMENTATION.
     IF s_tab[] IS NOT INITIAL.
       SELECT tabname
         FROM dd02l
-        INTO TABLE @DATA(lt_from_range)
         WHERE tabname  IN @s_tab
           AND as4local  = 'A'
-          AND tabclass IN ( 'TRANSP', 'POOL', 'CLUSTER', 'VIEW' ).
+          AND tabclass IN ( 'TRANSP', 'POOL', 'CLUSTER', 'VIEW' )
+        INTO TABLE @DATA(lt_from_range).
 
       LOOP AT lt_from_range INTO DATA(ls_rng).
         APPEND VALUE #( tabname = ls_rng-tabname ) TO rt_tabs.
@@ -497,20 +568,82 @@ CLASS lcl_auditor IMPLEMENTATION.
     ENDIF.
 
     " 4. Si no ingresó tablas pero sí indicó patrón de vistas CDS en S_CDS,
-    "    extraer automáticamente las tablas base desde DDDDLSRC
+    "    extraer automáticamente las tablas base desde DDDDLSRC (incluyendo
+    "    vistas que ya apunten a una Compatibility View como nsdm_e_marc)
     IF rt_tabs IS INITIAL AND s_cds[] IS NOT INITIAL.
+      DATA: lt_cand_objs  TYPE STANDARD TABLE OF ty_dep_obj_key,
+            lt_cand_ddls  TYPE STANDARD TABLE OF ty_dep_ddl_key,
+            lt_cand_vrefs TYPE STANDARD TABLE OF ty_viewref_key.
+
       SELECT ddlname, as4local, source
         FROM ddddlsrc
-        INTO TABLE @DATA(lt_ddl_tabs)
         WHERE ddlname  IN @s_cds
-          AND as4local IN ( 'A', 'I', 'N' ).
+          AND as4local IN ( 'A', 'I', 'N' )
+        INTO TABLE @DATA(lt_ddl_tabs).
 
       LOOP AT lt_ddl_tabs INTO DATA(ls_dt).
         DATA(lv_t_from_cds) = extract_from_table_in_ddl( ls_dt-source ).
         IF lv_t_from_cds IS NOT INITIAL.
           APPEND VALUE #( tabname = lv_t_from_cds ) TO rt_tabs.
+          APPEND VALUE #( objectname = lv_t_from_cds ) TO lt_cand_objs.
         ENDIF.
       ENDLOOP.
+
+      " Si alguna CDS apunta a una entidad proxy (ej. NSDM_E_MARC), resolver
+      " la tabla física original (ej. MARC) vía DDLDEPENDENCY -> DD02L-VIEWREF
+      SORT lt_cand_objs BY objectname.
+      DELETE ADJACENT DUPLICATES FROM lt_cand_objs COMPARING objectname.
+      IF lt_cand_objs IS NOT INITIAL.
+        SELECT ddlname, objectname, state, objecttype
+          FROM ddldependency
+          FOR ALL ENTRIES IN @lt_cand_objs
+          WHERE objectname = @lt_cand_objs-objectname
+            AND state      = 'A'
+          INTO TABLE @DATA(lt_rev_stob).
+
+        LOOP AT lt_rev_stob INTO DATA(ls_rs).
+          APPEND VALUE #( ddlname = ls_rs-ddlname ) TO lt_cand_ddls.
+        ENDLOOP.
+        SORT lt_cand_ddls BY ddlname.
+        DELETE ADJACENT DUPLICATES FROM lt_cand_ddls COMPARING ddlname.
+
+        IF lt_cand_ddls IS NOT INITIAL.
+          SELECT ddlname, objectname, state, objecttype
+            FROM ddldependency
+            FOR ALL ENTRIES IN @lt_cand_ddls
+            WHERE ddlname = @lt_cand_ddls-ddlname
+              AND state   = 'A'
+            INTO TABLE @DATA(lt_rev_views).
+
+          LOOP AT lt_rev_views INTO DATA(ls_rv).
+            APPEND VALUE #( objectname = ls_rv-objectname ) TO lt_cand_objs.
+          ENDLOOP.
+          SORT lt_cand_objs BY objectname.
+          DELETE ADJACENT DUPLICATES FROM lt_cand_objs COMPARING objectname.
+        ENDIF.
+
+        LOOP AT lt_cand_objs INTO DATA(ls_co).
+          IF ls_co-objectname IS NOT INITIAL.
+            APPEND VALUE #( viewref = CONV dd02l-viewref( ls_co-objectname ) )
+              TO lt_cand_vrefs.
+          ENDIF.
+        ENDLOOP.
+        SORT lt_cand_vrefs BY viewref.
+        DELETE ADJACENT DUPLICATES FROM lt_cand_vrefs COMPARING viewref.
+
+        IF lt_cand_vrefs IS NOT INITIAL.
+          SELECT tabname
+            FROM dd02l
+            FOR ALL ENTRIES IN @lt_cand_vrefs
+            WHERE viewref  = @lt_cand_vrefs-viewref
+              AND as4local = 'A'
+            INTO TABLE @DATA(lt_orig_tabs).
+
+          LOOP AT lt_orig_tabs INTO DATA(ls_ot).
+            APPEND VALUE #( tabname = ls_ot-tabname ) TO rt_tabs.
+          ENDLOOP.
+        ENDIF.
+      ENDIF.
     ENDIF.
 
     SORT rt_tabs BY tabname.
@@ -518,92 +651,366 @@ CLASS lcl_auditor IMPLEMENTATION.
     DELETE rt_tabs WHERE tabname IS INITIAL.
   ENDMETHOD.
 
-  METHOD extract_from_table_in_ddl.
-    " Extrae la tabla principal luego de 'as select from <tabla>'
-    DATA(lv_clean) = iv_source.
-    REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>cr_lf(1)
-      IN lv_clean WITH ` `.
-    REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>newline
-      IN lv_clean WITH ` `.
-    REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>horizontal_tab
-      IN lv_clean WITH ` `.
-    REPLACE ALL OCCURRENCES OF '{' IN lv_clean WITH ` { `.
-    lv_clean = condense( lv_clean ).
+  METHOD strip_ddl_comments_for_tokens.
+    " Limpia comentarios /*...*/, //... y --... y separadores DDL para
+    " extraer tokens SQL/CDS de forma 100% determinística sin REGEX
+    DATA: lt_lines TYPE tt_string_list,
+          lv_accum TYPE string.
 
-    FIND REGEX 'select\s+(?:distinct\s+)?from\s+([A-Za-z0-9_/]+)'
-      IN lv_clean IGNORING CASE SUBMATCHES DATA(lv_found) ##REGEX_POSIX.
-    IF sy-subrc = 0 AND lv_found IS NOT INITIAL.
-      rv_tabname = CONV dd02l-tabname( to_upper( lv_found ) ).
+    DATA(lv_src) = strip_internal_baseinfo( iv_source ).
+
+    " Eliminar comentarios de bloque /* ... */
+    DO 100 TIMES.
+      FIND FIRST OCCURRENCE OF '/*' IN lv_src MATCH OFFSET DATA(lv_b_off).
+      IF sy-subrc <> 0.
+        EXIT.
+      ENDIF.
+      DATA(lv_b_head) = COND string(
+        WHEN lv_b_off > 0 THEN substring( val = lv_src len = lv_b_off )
+        ELSE '' ).
+      DATA(lv_b_tail) = substring( val = lv_src off = lv_b_off ).
+      FIND FIRST OCCURRENCE OF '*/' IN lv_b_tail MATCH OFFSET DATA(lv_b_end).
+      IF sy-subrc = 0.
+        DATA(lv_b_after) = lv_b_end + 2.
+        IF lv_b_after < strlen( lv_b_tail ).
+          DATA(lv_b_rest) = substring( val = lv_b_tail off = lv_b_after ).
+          lv_src = lv_b_head && ` ` && lv_b_rest.
+        ELSE.
+          lv_src = lv_b_head.
+        ENDIF.
+      ELSE.
+        lv_src = lv_b_head.
+        EXIT.
+      ENDIF.
+    ENDDO.
+
+    SPLIT lv_src AT cl_abap_char_utilities=>newline INTO TABLE lt_lines.
+    LOOP AT lt_lines INTO DATA(lv_ln).
+      REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>cr_lf(1) IN lv_ln WITH ` `.
+      split_inline_comment(
+        EXPORTING iv_line = lv_ln
+        IMPORTING ev_code = DATA(lv_code_part) ).
+      IF lv_code_part IS NOT INITIAL AND lv_code_part(1) <> '@'.
+        lv_accum = lv_accum && ` ` && lv_code_part.
+      ENDIF.
+    ENDLOOP.
+
+    REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>horizontal_tab IN lv_accum WITH ` `.
+    REPLACE ALL OCCURRENCES OF '{' IN lv_accum WITH ` `.
+    REPLACE ALL OCCURRENCES OF '}' IN lv_accum WITH ` `.
+    REPLACE ALL OCCURRENCES OF '(' IN lv_accum WITH ` `.
+    REPLACE ALL OCCURRENCES OF ')' IN lv_accum WITH ` `.
+    REPLACE ALL OCCURRENCES OF ',' IN lv_accum WITH ` `.
+    REPLACE ALL OCCURRENCES OF ';' IN lv_accum WITH ` `.
+    rv_tokens = condense( lv_accum ).
+  ENDMETHOD.
+
+  METHOD extract_from_table_in_ddl.
+    " Extrae la tabla o vista principal luego de 'select [distinct] from <obj>'
+    DATA(lv_tokens_str) = strip_ddl_comments_for_tokens( iv_source ).
+    IF lv_tokens_str IS INITIAL.
+      RETURN.
     ENDIF.
+
+    SPLIT lv_tokens_str AT space INTO TABLE DATA(lt_words).
+    DATA(lv_total) = lines( lt_words ).
+    DATA(lv_i)     = 1.
+
+    WHILE lv_i <= lv_total.
+      DATA(lv_w_up) = to_upper( lt_words[ lv_i ] ).
+      IF lv_w_up = 'SELECT'.
+        DATA(lv_n1) = lv_i + 1.
+        DATA(lv_n2) = lv_i + 2.
+        DATA(lv_n3) = lv_i + 3.
+        IF lv_n2 <= lv_total AND to_upper( lt_words[ lv_n1 ] ) = 'FROM'.
+          DATA(lv_raw_obj) = lt_words[ lv_n2 ].
+          REPLACE ALL OCCURRENCES OF '"' IN lv_raw_obj WITH ''.
+          rv_tabname = CONV dd02l-tabname( to_upper( lv_raw_obj ) ).
+          RETURN.
+        ELSEIF lv_n3 <= lv_total
+               AND to_upper( lt_words[ lv_n1 ] ) = 'DISTINCT'
+               AND to_upper( lt_words[ lv_n2 ] ) = 'FROM'.
+          lv_raw_obj = lt_words[ lv_n3 ].
+          REPLACE ALL OCCURRENCES OF '"' IN lv_raw_obj WITH ''.
+          rv_tabname = CONV dd02l-tabname( to_upper( lv_raw_obj ) ).
+          RETURN.
+        ENDIF.
+      ENDIF.
+      lv_i = lv_i + 1.
+    ENDWHILE.
+  ENDMETHOD.
+
+  METHOD extract_defined_entity_in_ddl.
+    " Extrae el nombre de la entidad definida en 'define [root] view [entity] <ent>'
+    DATA(lv_tokens_str) = strip_ddl_comments_for_tokens( iv_source ).
+    IF lv_tokens_str IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    SPLIT lv_tokens_str AT space INTO TABLE DATA(lt_words).
+    DATA(lv_total) = lines( lt_words ).
+    DATA(lv_i)     = 1.
+
+    WHILE lv_i <= lv_total.
+      IF to_upper( lt_words[ lv_i ] ) = 'DEFINE'.
+        DATA(lv_j) = lv_i + 1.
+        WHILE lv_j <= lv_total.
+          DATA(lv_kw) = to_upper( lt_words[ lv_j ] ).
+          IF lv_kw = 'ROOT'
+             OR lv_kw = 'CUSTOM'
+             OR lv_kw = 'ABSTRACT'
+             OR lv_kw = 'TRANSIENT'
+             OR lv_kw = 'WRITABLE'.
+            lv_j = lv_j + 1.
+          ELSE.
+            EXIT.
+          ENDIF.
+        ENDWHILE.
+
+        IF lv_j <= lv_total AND to_upper( lt_words[ lv_j ] ) = 'VIEW'.
+          lv_j = lv_j + 1.
+          IF lv_j <= lv_total AND to_upper( lt_words[ lv_j ] ) = 'ENTITY'.
+            lv_j = lv_j + 1.
+          ENDIF.
+          IF lv_j <= lv_total.
+            DATA(lv_ent) = lt_words[ lv_j ].
+            REPLACE ALL OCCURRENCES OF '"' IN lv_ent WITH ''.
+            rv_entity = CONV dd02l-tabname( to_upper( lv_ent ) ).
+            RETURN.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+      lv_i = lv_i + 1.
+    ENDWHILE.
+  ENDMETHOD.
+
+  METHOD load_compat_mapping.
+    " Resuelve masivamente las Compatibility Views / Replacement Objects:
+    " DD02L-VIEWREF (ej. MARC -> NSDM_V_MARC) -> DDLDEPENDENCY (VIEW -> DDLNAME -> STOB)
+    " -> Entidad CDS real (ej. NSDM_E_MARC). También detecta vistas CDS tipo COSP -> V_COSP.
+    DATA: lt_lkp_objs TYPE STANDARD TABLE OF ty_dep_obj_key,
+          lt_lkp_ddls TYPE STANDARD TABLE OF ty_dep_ddl_key,
+          lt_dep_obj  TYPE STANDARD TABLE OF ty_ddl_dep,
+          lt_dep_ddl  TYPE STANDARD TABLE OF ty_ddl_dep.
+
+    CLEAR gt_compat.
+    IF gt_dd02l IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    LOOP AT gt_dd02l INTO DATA(ls_02).
+      IF ls_02-viewref IS NOT INITIAL.
+        APPEND VALUE #( objectname = ls_02-viewref ) TO lt_lkp_objs.
+      ELSEIF ls_02-tabclass = 'VIEW'.
+        APPEND VALUE #( objectname = ls_02-tabname ) TO lt_lkp_objs.
+      ENDIF.
+    ENDLOOP.
+
+    SORT lt_lkp_objs BY objectname.
+    DELETE ADJACENT DUPLICATES FROM lt_lkp_objs COMPARING objectname.
+    IF lt_lkp_objs IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    SELECT ddlname, objectname, state, objecttype
+      FROM ddldependency
+      FOR ALL ENTRIES IN @lt_lkp_objs
+      WHERE objectname = @lt_lkp_objs-objectname
+        AND state      = 'A'
+      INTO TABLE @lt_dep_obj.
+
+    LOOP AT lt_dep_obj INTO DATA(ls_do).
+      APPEND VALUE #( ddlname = ls_do-ddlname ) TO lt_lkp_ddls.
+    ENDLOOP.
+    LOOP AT lt_lkp_objs INTO DATA(ls_lo).
+      APPEND VALUE #( ddlname = CONV ddldependency-ddlname( ls_lo-objectname ) )
+        TO lt_lkp_ddls.
+    ENDLOOP.
+
+    SORT lt_lkp_ddls BY ddlname.
+    DELETE ADJACENT DUPLICATES FROM lt_lkp_ddls COMPARING ddlname.
+
+    IF lt_lkp_ddls IS NOT INITIAL.
+      SELECT ddlname, objectname, state, objecttype
+        FROM ddldependency
+        FOR ALL ENTRIES IN @lt_lkp_ddls
+        WHERE ddlname = @lt_lkp_ddls-ddlname
+          AND state   = 'A'
+        INTO TABLE @lt_dep_ddl.
+    ENDIF.
+
+    SORT lt_dep_obj BY objectname objecttype.
+    SORT lt_dep_ddl BY ddlname objecttype.
+
+    LOOP AT gt_dd02l INTO ls_02.
+      IF ls_02-viewref IS NOT INITIAL.
+        DATA(lv_proxy)     = ls_02-viewref.
+        DATA(lv_proxy_key) = CONV ddldependency-objectname( lv_proxy ).
+        DATA(lv_target)    = VALUE dd02l-tabname( ).
+        DATA(lv_ddlnam)    = VALUE ddldependency-ddlname( ).
+
+        " 1) ¿VIEWREF ya es directamente el objeto STOB (CDS Entity)?
+        READ TABLE lt_dep_obj INTO DATA(ls_direct_stob)
+          WITH KEY objectname = lv_proxy_key
+                   objecttype = 'STOB' BINARY SEARCH.
+        IF sy-subrc = 0.
+          lv_target = CONV dd02l-tabname( ls_direct_stob-objectname ).
+          lv_ddlnam = ls_direct_stob-ddlname.
+        ELSE.
+          " 2) Buscar como SQL View ('VIEW') -> obtener DDLNAME -> leer 'STOB'
+          READ TABLE lt_dep_obj INTO DATA(ls_view_dep)
+            WITH KEY objectname = lv_proxy_key
+                     objecttype = 'VIEW' BINARY SEARCH.
+          IF sy-subrc = 0.
+            lv_ddlnam = ls_view_dep-ddlname.
+          ELSE.
+            READ TABLE lt_dep_obj INTO DATA(ls_any_dep)
+              WITH KEY objectname = lv_proxy_key BINARY SEARCH.
+            IF sy-subrc = 0.
+              lv_ddlnam = ls_any_dep-ddlname.
+            ELSE.
+              lv_ddlnam = CONV ddldependency-ddlname( lv_proxy ).
+            ENDIF.
+          ENDIF.
+
+          IF lv_ddlnam IS NOT INITIAL.
+            READ TABLE lt_dep_ddl INTO DATA(ls_stob_dep)
+              WITH KEY ddlname    = lv_ddlnam
+                       objecttype = 'STOB' BINARY SEARCH.
+            IF sy-subrc = 0.
+              lv_target = CONV dd02l-tabname( ls_stob_dep-objectname ).
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+        " 3) Respaldo puntual desde DDDDLSRC si no figuraba STOB en DDLDEPENDENCY
+        "    (Se usa SELECT SINGLE sin FOR ALL ENTRIES porque SOURCE es STRING/LOB)
+        IF lv_target IS INITIAL AND lv_ddlnam IS NOT INITIAL.
+          DATA(lv_fb_key) = CONV ddddlsrc-ddlname( lv_ddlnam ).
+          DATA(lv_fb_src) = VALUE string( ).
+          SELECT SINGLE source
+            FROM ddddlsrc
+            WHERE ddlname  = @lv_fb_key
+              AND as4local = 'A'
+            INTO @lv_fb_src.
+          IF sy-subrc = 0 AND lv_fb_src IS NOT INITIAL.
+            lv_target = extract_defined_entity_in_ddl( lv_fb_src ).
+          ENDIF.
+        ENDIF.
+
+        IF lv_target IS INITIAL.
+          lv_target = CONV dd02l-tabname( lv_proxy ).
+        ENDIF.
+
+        APPEND VALUE ty_compat_map(
+          tabname    = ls_02-tabname
+          tabclass   = ls_02-tabclass
+          proxy_obj  = lv_proxy
+          cds_target = lv_target
+        ) TO gt_compat.
+
+      ELSEIF ls_02-tabclass = 'VIEW'.
+        " Caso COSP / COSS en S/4HANA (donde la propia vista es SQLView de una CDS estándar)
+        DATA(lv_vw_key) = CONV ddldependency-objectname( ls_02-tabname ).
+        READ TABLE lt_dep_obj INTO DATA(ls_vw_cds)
+          WITH KEY objectname = lv_vw_key
+                   objecttype = 'VIEW' BINARY SEARCH.
+        IF sy-subrc = 0 AND ls_vw_cds-ddlname IS NOT INITIAL.
+          READ TABLE lt_dep_ddl INTO DATA(ls_vw_stob)
+            WITH KEY ddlname    = ls_vw_cds-ddlname
+                     objecttype = 'STOB' BINARY SEARCH.
+          IF sy-subrc = 0 AND ls_vw_stob-objectname IS NOT INITIAL.
+            APPEND VALUE ty_compat_map(
+              tabname    = ls_02-tabname
+              tabclass   = ls_02-tabclass
+              proxy_obj  = ls_02-tabname
+              cds_target = CONV dd02l-tabname( ls_vw_stob-objectname )
+            ) TO gt_compat.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    SORT gt_compat BY tabname.
+    DELETE ADJACENT DUPLICATES FROM gt_compat COMPARING tabname.
   ENDMETHOD.
 
   METHOD load_cds_mapping.
-    DATA: lt_map TYPE tt_cds_map.
+    TYPES:
+      BEGIN OF ty_ddl_row,
+        ddlname  TYPE ddddlsrc-ddlname,
+        as4local TYPE ddddlsrc-as4local,
+        source   TYPE ddddlsrc-source,
+      END OF ty_ddl_row.
+
+    DATA: lt_map TYPE tt_cds_map,
+          lt_ddl TYPE STANDARD TABLE OF ty_ddl_row.
 
     CLEAR et_cds_map.
     IF it_valid_tabs IS INITIAL.
       RETURN.
     ENDIF.
 
-    " A) Leer vistas CDS desde DDDDLSRC (soporta View Entities modernas y
-    "    vistas clásicas, tanto Activas 'A' como Inactivas 'I'/'N').
-    "    Ordenando as4local DESCENDING ('N' > 'I' > 'A'), si existe versión
-    "    inactiva pendiente, toma estado 'INACTIVA'.
+    " Leer vistas CDS desde DDDDLSRC (Activas 'A' e Inactivas 'I'/'N').
+    " Reconoce tanto vistas que apuntan directo a la tabla (ej. MARC) como
+    " vistas ya modificadas para apuntar a su Compatibility View (ej. NSDM_E_MARC).
     IF s_cds[] IS NOT INITIAL.
       SELECT ddlname, as4local, source
         FROM ddddlsrc
-        INTO TABLE @DATA(lt_ddl)
         WHERE ddlname  IN @s_cds
-          AND as4local IN ( 'A', 'I', 'N' ).
-
-      SORT lt_ddl BY ddlname ASCENDING as4local DESCENDING.
-      DELETE ADJACENT DUPLICATES FROM lt_ddl COMPARING ddlname.
-
-      LOOP AT lt_ddl INTO DATA(ls_ddl).
-        DATA(lv_base_tab) = extract_from_table_in_ddl( ls_ddl-source ).
-        IF lv_base_tab IS NOT INITIAL.
-          READ TABLE it_valid_tabs TRANSPORTING NO FIELDS
-            WITH KEY tabname = lv_base_tab BINARY SEARCH.
-          IF sy-subrc = 0.
-            APPEND VALUE ty_cds_map(
-              tabname    = lv_base_tab
-              ddlname    = ls_ddl-ddlname
-              estado_cds = COND string( WHEN ls_ddl-as4local = 'A'
-                                        THEN 'ACTIVA'
-                                        ELSE 'INACTIVA' )
-            ) TO lt_map.
-          ENDIF.
-        ENDIF.
-      ENDLOOP.
+          AND as4local IN ( 'A', 'I', 'N' )
+        INTO TABLE @lt_ddl.
     ELSE.
       SELECT ddlname, as4local, source
         FROM ddddlsrc
-        INTO TABLE @DATA(lt_ddl_cust)
         WHERE ( ddlname LIKE 'Z%' OR ddlname LIKE 'Y%' )
-          AND as4local IN ( 'A', 'I', 'N' ).
-
-      SORT lt_ddl_cust BY ddlname ASCENDING as4local DESCENDING.
-      DELETE ADJACENT DUPLICATES FROM lt_ddl_cust COMPARING ddlname.
-
-      LOOP AT lt_ddl_cust INTO DATA(ls_cust).
-        DATA(lv_cust_tab) = extract_from_table_in_ddl( ls_cust-source ).
-        IF lv_cust_tab IS NOT INITIAL.
-          READ TABLE it_valid_tabs TRANSPORTING NO FIELDS
-            WITH KEY tabname = lv_cust_tab BINARY SEARCH.
-          IF sy-subrc = 0.
-            APPEND VALUE ty_cds_map(
-              tabname    = lv_cust_tab
-              ddlname    = ls_cust-ddlname
-              estado_cds = COND string( WHEN ls_cust-as4local = 'A'
-                                        THEN 'ACTIVA'
-                                        ELSE 'INACTIVA' )
-            ) TO lt_map.
-          ENDIF.
-        ENDIF.
-      ENDLOOP.
+          AND as4local IN ( 'A', 'I', 'N' )
+        INTO TABLE @lt_ddl.
     ENDIF.
 
-    SORT lt_map STABLE BY tabname ddlname.
+    SORT lt_ddl BY ddlname ASCENDING as4local DESCENDING.
+    DELETE ADJACENT DUPLICATES FROM lt_ddl COMPARING ddlname.
+
+    LOOP AT lt_ddl INTO DATA(ls_ddl).
+      DATA(lv_from_obj) = extract_from_table_in_ddl( ls_ddl-source ).
+      IF lv_from_obj IS INITIAL.
+        CONTINUE.
+      ENDIF.
+
+      DATA(lv_mapped_tab) = VALUE dd02l-tabname( ).
+      READ TABLE it_valid_tabs TRANSPORTING NO FIELDS
+        WITH KEY tabname = lv_from_obj BINARY SEARCH.
+      IF sy-subrc = 0.
+        lv_mapped_tab = lv_from_obj.
+      ELSEIF gt_compat IS NOT INITIAL.
+        LOOP AT gt_compat INTO DATA(ls_cmp)
+          WHERE cds_target = lv_from_obj OR proxy_obj = lv_from_obj.
+          READ TABLE it_valid_tabs TRANSPORTING NO FIELDS
+            WITH KEY tabname = ls_cmp-tabname BINARY SEARCH.
+          IF sy-subrc = 0.
+            lv_mapped_tab = ls_cmp-tabname.
+            IF ls_ddl-ddlname CS ls_cmp-tabname.
+              EXIT.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+      IF lv_mapped_tab IS NOT INITIAL.
+        DATA(lv_prio) = COND i( WHEN ls_ddl-ddlname CS lv_mapped_tab THEN 1 ELSE 2 ).
+        APPEND VALUE ty_cds_map(
+          tabname    = lv_mapped_tab
+          ddlname    = ls_ddl-ddlname
+          from_obj   = lv_from_obj
+          prio       = lv_prio
+          estado_cds = COND string( WHEN ls_ddl-as4local = 'A'
+                                    THEN 'ACTIVA'
+                                    ELSE 'INACTIVA' )
+        ) TO lt_map.
+      ENDIF.
+    ENDLOOP.
+
+    SORT lt_map STABLE BY tabname ASCENDING prio ASCENDING ddlname ASCENDING.
     DELETE ADJACENT DUPLICATES FROM lt_map COMPARING tabname.
     et_cds_map = lt_map.
   ENDMETHOD.
@@ -662,7 +1069,7 @@ CLASS lcl_auditor IMPLEMENTATION.
           lv_tiene_mandt TYPE c LENGTH 15,
           lv_campo_mandt TYPE c LENGTH 30.
 
-    CLEAR: gt_detail, gt_summary, gt_dd02l, gt_dd03l, go_salv.
+    CLEAR: gt_detail, gt_summary, gt_dd02l, gt_dd03l, gt_compat, go_salv.
     gv_trkorr = p_trkorr.
 
     " 1. Recolectar lista de tablas a auditar
@@ -673,24 +1080,27 @@ CLASS lcl_auditor IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    " 2. Consulta masiva #1: Metadatos de cabecera de tablas (DD02L y DD02T)
-    SELECT tabname, as4local, as4vers, tabclass, clidep
+    " 2. Consulta masiva #1: Metadatos de cabecera de tablas (DD02L + VIEWREF y DD02T)
+    SELECT tabname, as4local, as4vers, tabclass, clidep, viewref
       FROM dd02l
-      INTO TABLE @gt_dd02l
       FOR ALL ENTRIES IN @lt_req_tabs
       WHERE tabname  = @lt_req_tabs-tabname
-        AND as4local = 'A'.
+        AND as4local = 'A'
+      INTO TABLE @gt_dd02l.
 
     SORT gt_dd02l BY tabname as4vers.
     DELETE ADJACENT DUPLICATES FROM gt_dd02l COMPARING tabname.
 
+    " 2B. Resolver Compatibility Views / Objetos Proxy (DD02L-VIEWREF -> DDLDEPENDENCY)
+    load_compat_mapping( ).
+
     SELECT tabname, ddlanguage, as4local, as4vers, ddtext
       FROM dd02t
-      INTO TABLE @lt_dd02t
       FOR ALL ENTRIES IN @lt_req_tabs
       WHERE tabname     = @lt_req_tabs-tabname
         AND ddlanguage IN ( @sy-langu, 'S', 'E' )
-        AND as4local    = 'A'.
+        AND as4local    = 'A'
+      INTO TABLE @lt_dd02t.
 
     LOOP AT lt_dd02t ASSIGNING FIELD-SYMBOL(<fs_t>).
       IF <fs_t>-ddlanguage = sy-langu.
@@ -717,10 +1127,10 @@ CLASS lcl_auditor IMPLEMENTATION.
     IF lt_view_tabs IS NOT INITIAL.
       SELECT viewname, tabpos, as4local, as4vers, tabname
         FROM dd26s
-        INTO TABLE @lt_view_bases
         FOR ALL ENTRIES IN @lt_view_tabs
         WHERE viewname = @lt_view_tabs-tabname
-          AND as4local = 'A'.
+          AND as4local = 'A'
+        INTO TABLE @lt_view_bases.
       SORT lt_view_bases BY viewname tabpos.
     ENDIF.
 
@@ -731,14 +1141,14 @@ CLASS lcl_auditor IMPLEMENTATION.
              keyflag, rollname, datatype, leng, decimals,
              reftable, reffield
         FROM dd03l
-        INTO TABLE @gt_dd03l
         FOR ALL ENTRIES IN @lt_valid_tab
         WHERE tabname  = @lt_valid_tab-tabname
           AND as4local = 'A'
           AND datatype IN ( 'CLNT',
                             'RAW', 'LRAW', 'RSTR',
                             'D34R', 'D16R', 'D34S', 'D16S',
-                            'QUAN', 'CURR' ).
+                            'QUAN', 'CURR' )
+        INTO TABLE @gt_dd03l.
 
       DELETE gt_dd03l WHERE fieldname(1) = '.'.
       SORT gt_dd03l BY tabname position.
@@ -754,23 +1164,23 @@ CLASS lcl_auditor IMPLEMENTATION.
     DELETE ADJACENT DUPLICATES FROM lt_reftabs COMPARING tabname.
 
     IF lt_reftabs IS NOT INITIAL.
-      SELECT tabname, as4local, as4vers, tabclass, clidep
+      SELECT tabname, as4local, as4vers, tabclass, clidep, viewref
         FROM dd02l
-        INTO TABLE @lt_ref_dd02l
         FOR ALL ENTRIES IN @lt_reftabs
         WHERE tabname  = @lt_reftabs-tabname
-          AND as4local = 'A'.
+          AND as4local = 'A'
+        INTO TABLE @lt_ref_dd02l.
 
       SORT lt_ref_dd02l BY tabname as4vers.
       DELETE ADJACENT DUPLICATES FROM lt_ref_dd02l COMPARING tabname.
 
       SELECT tabname, fieldname, as4local, as4vers, position
         FROM dd03l
-        INTO TABLE @lt_ref_keys
         FOR ALL ENTRIES IN @lt_reftabs
         WHERE tabname  = @lt_reftabs-tabname
           AND as4local = 'A'
-          AND keyflag  = 'X'.
+          AND keyflag  = 'X'
+        INTO TABLE @lt_ref_keys.
 
       DELETE lt_ref_keys WHERE fieldname(1) = '.'.
       SORT lt_ref_keys BY tabname position.
@@ -793,7 +1203,8 @@ CLASS lcl_auditor IMPLEMENTATION.
 
       READ TABLE lt_cds_map INTO DATA(ls_cds)
         WITH KEY tabname = ls_req-tabname BINARY SEARCH.
-      IF sy-subrc = 0.
+      DATA(lv_has_cds_map) = COND abap_bool( WHEN sy-subrc = 0 THEN abap_true ELSE abap_false ).
+      IF lv_has_cds_map = abap_true.
         ls_sum-cds_view   = ls_cds-ddlname.
         ls_sum-estado_cds = ls_cds-estado_cds.
         IF ls_sum-estado_cds = 'INACTIVA'.
@@ -814,6 +1225,10 @@ CLASS lcl_auditor IMPLEMENTATION.
         WITH KEY tabname = ls_req-tabname BINARY SEARCH.
       IF sy-subrc <> 0.
         ls_sum-estado_tab  = 'NO EXISTE EN SE11'.
+        ls_sum-es_compat   = 'N/A'.
+        ls_sum-proxy_obj   = '-'.
+        ls_sum-cds_target  = '-'.
+        ls_sum-codigo_repl = '-'.
         ls_sum-tiene_mandt = 'N/A'.
         ls_sum-campo_mandt = 'TABLA NO EXISTE'.
         ls_sum-accion_cds  = 'VERIFICAR NOMBRE DE TABLA'.
@@ -824,6 +1239,10 @@ CLASS lcl_auditor IMPLEMENTATION.
 
         DATA(ls_missing) = VALUE ty_detail(
           tabname       = ls_req-tabname
+          es_compat     = 'N/A'
+          proxy_obj     = '-'
+          cds_target    = '-'
+          codigo_repl   = '-'
           tiene_mandt   = 'N/A'
           campo_mandt   = 'TABLA NO EXISTE'
           categoria     = 'ERROR TABLA'
@@ -837,8 +1256,48 @@ CLASS lcl_auditor IMPLEMENTATION.
         CONTINUE.
       ENDIF.
 
+      " Verificar si la tabla tiene Compatibility View / Objeto Proxy (ej. MARC -> NSDM_E_MARC)
+      DATA(lv_has_compat)     = abap_false.
+      DATA(lv_compat_pointed) = abap_false.
+      ls_sum-es_compat   = 'NO'.
+      ls_sum-proxy_obj   = '-'.
+      ls_sum-cds_target  = '-'.
+      ls_sum-codigo_repl = '-'.
+
+      READ TABLE gt_compat INTO DATA(ls_compat_row)
+        WITH KEY tabname = ls_req-tabname BINARY SEARCH.
+      IF sy-subrc = 0 AND ls_compat_row-cds_target IS NOT INITIAL.
+        lv_has_compat     = abap_true.
+        ls_sum-proxy_obj  = ls_compat_row-proxy_obj.
+        ls_sum-cds_target = ls_compat_row-cds_target.
+
+        DATA(lv_cds_for_stmt) = COND string(
+          WHEN ls_sum-cds_view IS NOT INITIAL THEN CONV string( ls_sum-cds_view )
+          ELSE |ZCDS_{ ls_req-tabname }| ).
+        DATA(lv_trg_low_stmt) = to_lower( CONV string( ls_compat_row-cds_target ) ).
+        DATA(lv_tab_low_stmt) = to_lower( CONV string( ls_req-tabname ) ).
+        ls_sum-codigo_repl =
+          |define root view entity { lv_cds_for_stmt } | &&
+          |as select from { lv_trg_low_stmt } as { lv_tab_low_stmt }|.
+
+        IF lv_has_cds_map = abap_true AND ls_cds-from_obj = ls_compat_row-cds_target.
+          lv_compat_pointed = abap_true.
+        ENDIF.
+
+        IF ls_tab-tabclass = 'TRANSP'.
+          ls_sum-es_compat = COND string(
+            WHEN lv_compat_pointed = abap_true THEN 'SI (YA APUNTA)'
+            ELSE 'SI (REEMPLAZAR)' ).
+        ELSE.
+          ls_sum-es_compat = 'SI (VISTA CDS)'.
+        ENDIF.
+      ENDIF.
+
+      DATA(lv_transp_lbl) = COND string(
+        WHEN lv_has_compat = abap_true THEN 'TRANSP (COMPAT.)'
+        ELSE 'TRANSPARENTE' ).
       ls_sum-estado_tab = SWITCH string( ls_tab-tabclass
-        WHEN 'TRANSP'  THEN 'TRANSPARENTE'
+        WHEN 'TRANSP'  THEN lv_transp_lbl
         WHEN 'INTTAB'  THEN 'ESTRUCTURA'
         WHEN 'VIEW'    THEN 'VISTA DDIC'
         WHEN 'CLUSTER' THEN 'CLUSTER'
@@ -849,6 +1308,28 @@ CLASS lcl_auditor IMPLEMENTATION.
         add_cell_color( EXPORTING iv_fname = 'ESTADO_TAB'
                                   iv_col   = 6
                                   iv_int   = 1
+                        CHANGING  ct_color = ls_sum-t_color ).
+      ELSEIF lv_has_compat = abap_true.
+        add_cell_color( EXPORTING iv_fname = 'ESTADO_TAB'
+                                  iv_col   = 3
+                                  iv_int   = 1
+                        CHANGING  ct_color = ls_sum-t_color ).
+      ENDIF.
+
+      IF lv_has_compat = abap_true.
+        DATA(lv_cmp_col) = COND i( WHEN lv_compat_pointed = abap_true THEN 5 ELSE 7 ).
+        DATA(lv_cmp_int) = COND i( WHEN lv_compat_pointed = abap_true THEN 0 ELSE 1 ).
+        add_cell_color( EXPORTING iv_fname = 'ES_COMPAT'
+                                  iv_col   = lv_cmp_col
+                                  iv_int   = lv_cmp_int
+                        CHANGING  ct_color = ls_sum-t_color ).
+        add_cell_color( EXPORTING iv_fname = 'PROXY_OBJ'
+                                  iv_col   = lv_cmp_col
+                                  iv_int   = lv_cmp_int
+                        CHANGING  ct_color = ls_sum-t_color ).
+        add_cell_color( EXPORTING iv_fname = 'CDS_TARGET'
+                                  iv_col   = lv_cmp_col
+                                  iv_int   = lv_cmp_int
                         CHANGING  ct_color = ls_sum-t_color ).
       ENDIF.
 
@@ -916,11 +1397,71 @@ CLASS lcl_auditor IMPLEMENTATION.
       DATA(lv_dfraw_str)  = VALUE string( ).
       DATA(lv_qc_str)     = VALUE string( ).
 
+      " Si es una tabla TRANSP con Compatibility View (ej. MARC -> NSDM_E_MARC),
+      " agregar fila arquitectónica con el objeto Proxy SE16N y el código de reemplazo
+      IF ls_tab-tabclass = 'TRANSP' AND lv_has_compat = abap_true.
+        DATA(ls_cmp_det) = VALUE ty_detail(
+          tabname        = ls_req-tabname
+          ddtext         = ls_sum-ddtext
+          es_compat      = ls_sum-es_compat
+          proxy_obj      = ls_sum-proxy_obj
+          cds_target     = ls_sum-cds_target
+          codigo_repl    = ls_sum-codigo_repl
+          cds_view       = ls_sum-cds_view
+          estado_cds     = ls_sum-estado_cds
+          tiene_mandt    = lv_tiene_mandt
+          campo_mandt    = lv_campo_mandt
+          categoria      = 'COMPATIBILITY VIEW'
+          fieldname      = '-'
+          reftable       = ls_sum-proxy_obj
+          ubicacion_ref  = COND string(
+            WHEN lv_compat_pointed = abap_true
+            THEN |YA APUNTA A { ls_sum-cds_target }|
+            ELSE |APUNTAR A: { ls_sum-cds_target }| )
+          sugerencia_cds = ls_sum-codigo_repl
+          nota_tecnica   = COND string(
+            WHEN lv_compat_pointed = abap_true
+            THEN |OK: La vista CDS ya selecciona desde { ls_sum-cds_target } (Proxy SE16N: { ls_sum-proxy_obj })|
+            ELSE |Proxy SE16N: { ls_sum-proxy_obj } -> Reemplazar SELECT FROM a { ls_sum-cds_target }| )
+        ).
+        DATA(lv_cdet_col) = COND i( WHEN lv_compat_pointed = abap_true THEN 5 ELSE 7 ).
+        DATA(lv_cdet_int) = COND i( WHEN lv_compat_pointed = abap_true THEN 0 ELSE 1 ).
+        add_cell_color( EXPORTING iv_fname = 'CATEGORIA'
+                                  iv_col   = lv_cdet_col
+                                  iv_int   = lv_cdet_int
+                        CHANGING  ct_color = ls_cmp_det-t_color ).
+        add_cell_color( EXPORTING iv_fname = 'UBICACION_REF'
+                                  iv_col   = lv_cdet_col
+                                  iv_int   = lv_cdet_int
+                        CHANGING  ct_color = ls_cmp_det-t_color ).
+        add_cell_color( EXPORTING iv_fname = 'ES_COMPAT'
+                                  iv_col   = lv_cdet_col
+                                  iv_int   = lv_cdet_int
+                        CHANGING  ct_color = ls_cmp_det-t_color ).
+        IF ls_cmp_det-estado_cds = 'INACTIVA'.
+          add_cell_color( EXPORTING iv_fname = 'ESTADO_CDS'
+                                    iv_col   = 6
+                                    iv_int   = 1
+                          CHANGING  ct_color = ls_cmp_det-t_color ).
+        ELSEIF ls_cmp_det-estado_cds = 'ACTIVA'.
+          add_cell_color( EXPORTING iv_fname = 'ESTADO_CDS'
+                                    iv_col   = 5
+                                    iv_int   = 0
+                          CHANGING  ct_color = ls_cmp_det-t_color ).
+        ENDIF.
+        APPEND ls_cmp_det TO gt_detail.
+        lv_rows_added = lv_rows_added + 1.
+      ENDIF.
+
       " Si es una VISTA DDIC (VIEW), agregar fila de alerta arquitectónica
       IF ls_tab-tabclass = 'VIEW'.
         DATA(ls_vw_det) = VALUE ty_detail(
           tabname        = ls_req-tabname
           ddtext         = ls_sum-ddtext
+          es_compat      = ls_sum-es_compat
+          proxy_obj      = ls_sum-proxy_obj
+          cds_target     = ls_sum-cds_target
+          codigo_repl    = ls_sum-codigo_repl
           cds_view       = ls_sum-cds_view
           estado_cds     = ls_sum-estado_cds
           tiene_mandt    = lv_tiene_mandt
@@ -929,13 +1470,17 @@ CLASS lcl_auditor IMPLEMENTATION.
           fieldname      = '-'
           ubicacion_ref  = 'NO PERMITIDA EN VIEW ENTITY'
           sugerencia_cds = COND string(
+            WHEN lv_has_compat = abap_true
+            THEN ls_sum-codigo_repl
             WHEN lv_view_bases_str IS NOT INITIAL
-            THEN |Replicar tablas físicas: { lv_view_bases_str }|
-            ELSE 'Replicar tablas físicas base (o usar define view sin CDC)' )
+            THEN |Replicar tablas físicas: { lv_view_bases_str } (o Create CDS Obsolete sin CDC)|
+            ELSE 'Replicar tablas físicas base (o Create CDS View Obsolete sin CDC)' )
           nota_tecnica   = COND string(
+            WHEN lv_has_compat = abap_true
+            THEN |Vista CDS estándar ({ ls_sum-cds_target }). Usar entidad destino o Create CDS Obsolete (Full Load)|
             WHEN lv_view_bases_str IS NOT INITIAL
             THEN |Objeto VIEW no soportado en View Entity/CDC. Tablas base: { lv_view_bases_str }|
-            ELSE 'Objeto VIEW/Compatibility View no soportado en View Entity ni CDC' )
+            ELSE 'Objeto VIEW no soportado en View Entity ni CDC; usar Create CDS Obsolete sin CDC' )
         ).
         add_cell_color( EXPORTING iv_fname = 'CATEGORIA'
                                   iv_col   = 6
@@ -964,6 +1509,10 @@ CLASS lcl_auditor IMPLEMENTATION.
           DATA(ls_det) = VALUE ty_detail(
             tabname     = ls_req-tabname
             ddtext      = ls_sum-ddtext
+            es_compat   = ls_sum-es_compat
+            proxy_obj   = ls_sum-proxy_obj
+            cds_target  = ls_sum-cds_target
+            codigo_repl = ls_sum-codigo_repl
             cds_view    = ls_sum-cds_view
             estado_cds  = ls_sum-estado_cds
             tiene_mandt = lv_tiene_mandt
@@ -1071,20 +1620,21 @@ CLASS lcl_auditor IMPLEMENTATION.
               WHEN lv_dfraw_str IS INITIAL THEN |{ ls_col-fieldname }({ lv_df_lbl })|
               ELSE |{ lv_dfraw_str }, { ls_col-fieldname }({ lv_df_lbl })| ).
 
-            ls_det-categoria     = lv_df_lbl.
-            ls_det-ubicacion_ref = 'DECFLOAT RAW (ERROR EN BQ)'.
+            ls_det-categoria = lv_df_lbl.
 
-            DATA(lv_df_prec) = COND int4(
-              WHEN ls_col-datatype = 'D16R' OR ls_col-datatype = 'D16S'
-              THEN 16
-              ELSE 23 ).
-
-            ls_det-sugerencia_cds =
-              |{ lv_key_prefix }cast( { lv_field_low } | &&
-              |as abap.dec({ lv_df_prec },6) ) as { lv_alias }|.
-            ls_det-nota_tecnica   =
-              |{ lv_df_lbl } no soportado en BQ/ODP: | &&
-              |castear a abap.dec (S/4 2022+) o comentar/excluir de la CDS|.
+            IF ls_col-keyflag = 'X'.
+              ls_det-ubicacion_ref  = 'CLAVE DF*_RAW (REVISAR MANUAL)'.
+              ls_det-sugerencia_cds =
+                |// CLAVE { lv_field_low } ({ lv_df_lbl }): no se comenta automáticamente|.
+              ls_det-nota_tecnica   =
+                |{ lv_df_lbl } es clave primaria: revisar manualmente antes de excluir|.
+            ELSE.
+              ls_det-ubicacion_ref  = 'DECFLOAT RAW -> COMENTAR'.
+              ls_det-sugerencia_cds =
+                |// { lv_field_low } // Excluido: { lv_df_lbl } no soportado en CDS/BQ|.
+              ls_det-nota_tecnica   =
+                |{ lv_df_lbl } no admite CAST en CDS ni carga ODP/BQ; el motor lo comenta automáticamente|.
+            ENDIF.
 
             add_cell_color( EXPORTING iv_fname = 'CATEGORIA'
                                       iv_col   = 6
@@ -1209,6 +1759,10 @@ CLASS lcl_auditor IMPLEMENTATION.
         DATA(ls_clean_det) = VALUE ty_detail(
           tabname        = ls_req-tabname
           ddtext         = ls_sum-ddtext
+          es_compat      = ls_sum-es_compat
+          proxy_obj      = ls_sum-proxy_obj
+          cds_target     = ls_sum-cds_target
+          codigo_repl    = ls_sum-codigo_repl
           cds_view       = ls_sum-cds_view
           estado_cds     = ls_sum-estado_cds
           tiene_mandt    = lv_tiene_mandt
@@ -1268,23 +1822,34 @@ CLASS lcl_auditor IMPLEMENTATION.
 
       IF ls_tab-tabclass = 'VIEW'.
         ls_sum-accion_cds = COND string(
+          WHEN lv_has_compat = abap_true
+          THEN |VISTA CDS -> Apuntar a { ls_sum-cds_target } o Create CDS Obsolete (Full)|
           WHEN lv_view_bases_str IS NOT INITIAL
-          THEN |NO VIEW ENTITY -> Usar tablas base: { lv_view_bases_str }|
-          ELSE 'NO VIEW ENTITY -> Usar tablas físicas base (o define view)' ).
+          THEN |NO VIEW ENTITY -> Tablas base: { lv_view_bases_str } (o Obsolete Full)|
+          ELSE 'NO VIEW ENTITY -> Usar tablas físicas base (o Obsolete Full)' ).
         add_cell_color( EXPORTING iv_fname = 'ACCION_CDS'
                                   iv_col   = 6
                                   iv_int   = 1
                         CHANGING  ct_color = ls_sum-t_color ).
+      ELSEIF lv_has_compat = abap_true AND lv_compat_pointed = abap_false.
+        ls_sum-accion_cds = COND string(
+          WHEN lv_has_bin = abap_true OR lv_has_qc = abap_true
+          THEN |APUNTAR A { ls_sum-cds_target } + AJUSTAR COLUMNAS|
+          ELSE |APUNTAR SELECT A { ls_sum-cds_target }| ).
+        add_cell_color( EXPORTING iv_fname = 'ACCION_CDS'
+                                  iv_col   = 7
+                                  iv_int   = 1
+                        CHANGING  ct_color = ls_sum-t_color ).
       ELSEIF lv_has_bin = abap_true AND lv_has_qc = abap_true.
         ls_sum-accion_cds = COND string(
-          WHEN ls_sum-cant_dfraw > 0 THEN 'CORREGIR RAW/DF34_RAW + QUAN/CURR'
+          WHEN ls_sum-cant_dfraw > 0 THEN 'COMENTAR DF34_RAW + AJUSTAR RAW/QUAN/CURR'
           ELSE 'CORREGIR RAW + QUAN/CURR' ).
         add_cell_color( EXPORTING iv_fname = 'ACCION_CDS'
                                   iv_col   = 6
                                   iv_int   = 1
                         CHANGING  ct_color = ls_sum-t_color ).
       ELSEIF ls_sum-cant_dfraw > 0.
-        ls_sum-accion_cds = 'CORREGIR DF34_RAW / DF16_RAW'.
+        ls_sum-accion_cds = 'COMENTAR DF34_RAW / DF16_RAW'.
         add_cell_color( EXPORTING iv_fname = 'ACCION_CDS'
                                   iv_col   = 6
                                   iv_int   = 1
@@ -1390,6 +1955,18 @@ CLASS lcl_auditor IMPLEMENTATION.
         set_col_text( io_cols = lo_cols iv_col = 'DDTEXT'
                       iv_s = 'Descrip.'   iv_m = 'Descripción Tabla'
                       iv_l = 'Descripción de la Tabla (SE11)' ).
+        set_col_text( io_cols = lo_cols iv_col = 'ES_COMPAT'
+                      iv_s = '¿Compat.?'  iv_m = 'Compatibility View'
+                      iv_l = '¿Tiene Compatibility View / Proxy?' ).
+        set_col_text( io_cols = lo_cols iv_col = 'PROXY_OBJ'
+                      iv_s = 'Obj.Proxy'  iv_m = 'Objeto Proxy SE16N'
+                      iv_l = 'Objeto Proxy SE16N (Doble clic SE11)' ).
+        set_col_text( io_cols = lo_cols iv_col = 'CDS_TARGET'
+                      iv_s = 'Ent.Dest.'  iv_m = 'Entidad Reemplazo'
+                      iv_l = 'Entidad CDS Destino (Doble clic ve DDL)' ).
+        set_col_text( io_cols = lo_cols iv_col = 'CODIGO_REPL'
+                      iv_s = 'Reemplazo'  iv_m = 'Código Reemplazo'
+                      iv_l = 'Sentencia DEFINE/SELECT de Reemplazo' ).
         set_col_text( io_cols = lo_cols iv_col = 'CDS_VIEW'
                       iv_s = 'Vista CDS'  iv_m = 'Vista CDS'
                       iv_l = 'Vista CDS (Doble clic ve código)' ).
@@ -1484,6 +2061,18 @@ CLASS lcl_auditor IMPLEMENTATION.
         set_col_text( io_cols = lo_cols iv_col = 'ESTADO_TAB'
                       iv_s = 'Tipo Tab.'  iv_m = 'Clase Tabla SE11'
                       iv_l = 'Clase de Tabla en SE11 (TRANSP/VIEW)' ).
+        set_col_text( io_cols = lo_cols iv_col = 'ES_COMPAT'
+                      iv_s = '¿Compat.?'  iv_m = 'Compatibility View'
+                      iv_l = '¿Tiene Compatibility View / Proxy?' ).
+        set_col_text( io_cols = lo_cols iv_col = 'PROXY_OBJ'
+                      iv_s = 'Obj.Proxy'  iv_m = 'Objeto Proxy SE16N'
+                      iv_l = 'Objeto Proxy SE16N (Doble clic SE11)' ).
+        set_col_text( io_cols = lo_cols iv_col = 'CDS_TARGET'
+                      iv_s = 'Ent.Dest.'  iv_m = 'Entidad Reemplazo'
+                      iv_l = 'Entidad CDS Destino (Doble clic ve DDL)' ).
+        set_col_text( io_cols = lo_cols iv_col = 'CODIGO_REPL'
+                      iv_s = 'Reemplazo'  iv_m = 'Código Reemplazo'
+                      iv_l = 'Sentencia DEFINE/SELECT de Reemplazo' ).
         set_col_text( io_cols = lo_cols iv_col = 'CDS_VIEW'
                       iv_s = 'Vista CDS'  iv_m = 'Vista CDS'
                       iv_l = 'Vista CDS (Doble clic ve código)' ).
@@ -1544,15 +2133,22 @@ CLASS lcl_auditor IMPLEMENTATION.
         RETURN.
       ENDIF.
 
-      IF column = 'REFTABLE' AND ls_det-reftable IS NOT INITIAL.
+      IF column = 'REFTABLE' AND ls_det-reftable IS NOT INITIAL AND ls_det-reftable <> '-'.
         open_se11_table( ls_det-reftable ).
+      ELSEIF column = 'PROXY_OBJ' AND ls_det-proxy_obj IS NOT INITIAL AND ls_det-proxy_obj <> '-'.
+        open_se11_table( ls_det-proxy_obj ).
+      ELSEIF column = 'CDS_TARGET' AND ls_det-cds_target IS NOT INITIAL AND ls_det-cds_target <> '-'.
+        preview_std_cds_target( iv_cds_target = ls_det-cds_target
+                                iv_proxy_obj  = ls_det-proxy_obj ).
       ELSEIF column = 'ESTADO_CDS' AND ls_det-cds_view IS NOT INITIAL.
         prompt_single_cds_action( iv_tabname = ls_det-tabname
                                   iv_ddlname = ls_det-cds_view ).
-      ELSEIF ( column = 'CDS_VIEW' OR column = 'SUGERENCIA_CDS' )
+      ELSEIF ( column = 'CDS_VIEW' OR column = 'SUGERENCIA_CDS' OR column = 'CODIGO_REPL' )
              AND ls_det-cds_view IS NOT INITIAL.
         preview_cds_code( iv_ddlname = ls_det-cds_view
                           iv_tabname = ls_det-tabname ).
+      ELSEIF column = 'CODIGO_REPL' AND ls_det-codigo_repl IS NOT INITIAL AND ls_det-codigo_repl <> '-'.
+        MESSAGE ls_det-codigo_repl TYPE 'I'.
       ELSEIF ls_det-tabname IS NOT INITIAL.
         open_se11_table( ls_det-tabname ).
       ENDIF.
@@ -1563,13 +2159,21 @@ CLASS lcl_auditor IMPLEMENTATION.
         RETURN.
       ENDIF.
 
-      IF ( column = 'ESTADO_CDS' OR column = 'ACCION_CDS' )
+      IF column = 'PROXY_OBJ' AND ls_sum-proxy_obj IS NOT INITIAL AND ls_sum-proxy_obj <> '-'.
+        open_se11_table( ls_sum-proxy_obj ).
+      ELSEIF column = 'CDS_TARGET' AND ls_sum-cds_target IS NOT INITIAL AND ls_sum-cds_target <> '-'.
+        preview_std_cds_target( iv_cds_target = ls_sum-cds_target
+                                iv_proxy_obj  = ls_sum-proxy_obj ).
+      ELSEIF ( column = 'ESTADO_CDS' OR column = 'ACCION_CDS' )
          AND ls_sum-cds_view IS NOT INITIAL.
         prompt_single_cds_action( iv_tabname = ls_sum-tabname
                                   iv_ddlname = ls_sum-cds_view ).
-      ELSEIF column = 'CDS_VIEW' AND ls_sum-cds_view IS NOT INITIAL.
+      ELSEIF ( column = 'CDS_VIEW' OR column = 'CODIGO_REPL' )
+             AND ls_sum-cds_view IS NOT INITIAL.
         preview_cds_code( iv_ddlname = ls_sum-cds_view
                           iv_tabname = ls_sum-tabname ).
+      ELSEIF column = 'CODIGO_REPL' AND ls_sum-codigo_repl IS NOT INITIAL AND ls_sum-codigo_repl <> '-'.
+        MESSAGE ls_sum-codigo_repl TYPE 'I'.
       ELSEIF ls_sum-tabname IS NOT INITIAL.
         open_se11_table( ls_sum-tabname ).
       ENDIF.
@@ -1577,17 +2181,54 @@ CLASS lcl_auditor IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD open_se11_table.
+    DATA(lv_obj) = CONV dd02l-tabname( iv_tabname ).
     CALL FUNCTION 'RS_TOOL_ACCESS'
       EXPORTING
         operation   = 'SHOW'
-        object_name = iv_tabname
+        object_name = lv_obj
         object_type = 'TABL'
       EXCEPTIONS
         OTHERS      = 1.
     IF sy-subrc <> 0.
-      MESSAGE |No fue posible abrir { iv_tabname } en SE11.|
+      MESSAGE |No fue posible abrir { lv_obj } en SE11.|
         TYPE 'S' DISPLAY LIKE 'W'.
     ENDIF.
+  ENDMETHOD.
+
+  METHOD preview_std_cds_target.
+    DATA: lv_objname TYPE ddldependency-objectname,
+          lv_ddlname TYPE ddddlsrc-ddlname,
+          lt_lines   TYPE tt_string_list.
+
+    lv_objname = CONV ddldependency-objectname( iv_cds_target ).
+    SELECT SINGLE ddlname
+      FROM ddldependency
+      WHERE objectname = @lv_objname
+        AND state      = 'A'
+      INTO @lv_ddlname.
+
+    IF sy-subrc <> 0 OR lv_ddlname IS INITIAL.
+      lv_ddlname = CONV ddddlsrc-ddlname( iv_cds_target ).
+    ENDIF.
+
+    DATA(lv_src) = VALUE string( ).
+    SELECT SINGLE source
+      FROM ddddlsrc
+      WHERE ddlname  = @lv_ddlname
+        AND as4local = 'A'
+      INTO @lv_src.
+
+    IF sy-subrc <> 0 OR lv_src IS INITIAL.
+      MESSAGE |Entidad destino: { iv_cds_target } (Proxy SE16N: { iv_proxy_obj }).|
+        TYPE 'I'.
+      RETURN.
+    ENDIF.
+
+    DATA(lv_clean) = strip_internal_baseinfo( lv_src ).
+    SPLIT lv_clean AT cl_abap_char_utilities=>newline INTO TABLE lt_lines.
+    cl_demo_output=>display_data(
+      value = lt_lines
+      name  = |Definición Estándar SAP: { iv_cds_target } (DDL: { lv_ddlname }, Proxy: { iv_proxy_obj })| ).
   ENDMETHOD.
 
   METHOD trim_spaces.
@@ -1747,12 +2388,195 @@ CLASS lcl_auditor IMPLEMENTATION.
     ENDIF.
   ENDMETHOD.
 
+  METHOD rewrite_compat_from_clause.
+    " Reescribe en la cabecera (lt_prefix) únicamente la cláusula:
+    "   as select [distinct] from <tabla>  -->  as select [distinct] from <cds_target> as <tabla>
+    " sin tocar anotaciones (@Analytics / changeDataCapture.automatic: true) ni comentarios.
+    cv_compat_chg = abap_false.
+
+    DATA(lv_tab_low) = to_lower( condense( CONV string( iv_tabname ) ) ).
+    DATA(lv_prx_low) = to_lower( condense( CONV string( iv_proxy_obj ) ) ).
+    DATA(lv_trg_low) = to_lower( condense( CONV string( iv_cds_target ) ) ).
+    IF lv_tab_low IS INITIAL OR lv_trg_low IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    DATA(lv_in_blk)    = abap_false.
+    DATA(lv_seen_sel)  = abap_false.
+    DATA(lv_wait_src)  = abap_false.
+    DATA(lv_total_prf) = lines( ct_prefix ).
+
+    LOOP AT ct_prefix ASSIGNING FIELD-SYMBOL(<fs_pl>).
+      DATA(lv_p_idx) = sy-tabix.
+      DATA(lv_pt)    = trim_spaces( <fs_pl> ).
+
+      IF lv_in_blk = abap_true.
+        IF lv_pt CS '*/'.
+          lv_in_blk = abap_false.
+        ENDIF.
+        CONTINUE.
+      ENDIF.
+
+      IF strlen( lv_pt ) >= 2 AND lv_pt(2) = '/*'.
+        IF NOT ( lv_pt CS '*/' ).
+          lv_in_blk = abap_true.
+        ENDIF.
+        CONTINUE.
+      ENDIF.
+
+      IF lv_pt IS INITIAL
+         OR ( strlen( lv_pt ) >= 2 AND ( lv_pt(2) = '//' OR lv_pt(2) = '--' ) )
+         OR lv_pt(1) = '*'
+         OR lv_pt(1) = '@'.
+        CONTINUE.
+      ENDIF.
+
+      split_inline_comment(
+        EXPORTING iv_line   = <fs_pl>
+        IMPORTING ev_indent = DATA(lv_pind)
+                  ev_code   = DATA(lv_pcode)
+                  ev_cmt    = DATA(lv_pcmt) ).
+
+      IF lv_pcode IS INITIAL.
+        CONTINUE.
+      ENDIF.
+
+      DATA(lv_norm) = lv_pcode.
+      REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>horizontal_tab IN lv_norm WITH ` `.
+      REPLACE ALL OCCURRENCES OF '{' IN lv_norm WITH ` { `.
+      lv_norm = condense( lv_norm ).
+      SPLIT lv_norm AT space INTO TABLE DATA(lt_ptoks).
+      DATA(lv_ntoks) = lines( lt_ptoks ).
+      DATA(lv_ti)    = 1.
+
+      WHILE lv_ti <= lv_ntoks.
+        DATA(lv_tok)     = lt_ptoks[ lv_ti ].
+        DATA(lv_tok_low) = to_lower( lv_tok ).
+
+        " Caso borde: 'from' quedó al final de la línea anterior y la tabla va aquí
+        IF lv_wait_src = abap_true.
+          DATA(lv_src_w) = lv_tok_low.
+          REPLACE ALL OCCURRENCES OF '"' IN lv_src_w WITH ''.
+          IF lv_src_w = lv_trg_low.
+            RETURN.
+          ENDIF.
+          IF lv_src_w = lv_tab_low
+             OR ( lv_prx_low IS NOT INITIAL AND lv_src_w = lv_prx_low ).
+            DATA(lv_has_al_w) = abap_false.
+            DATA(lv_nx_tw)    = lv_ti + 1.
+            IF lv_nx_tw <= lv_ntoks AND to_lower( lt_ptoks[ lv_nx_tw ] ) = 'as'.
+              lv_has_al_w = abap_true.
+            ENDIF.
+            DATA(lv_rep_w) = COND string(
+              WHEN lv_has_al_w = abap_true THEN lv_trg_low
+              ELSE |{ lv_trg_low } as { lv_tab_low }| ).
+            DATA(lv_new_cw) = lv_pcode.
+            REPLACE FIRST OCCURRENCE OF lv_tok IN lv_new_cw WITH lv_rep_w IGNORING CASE.
+            <fs_pl> = lv_pind && lv_new_cw &&
+                      COND string( WHEN lv_pcmt IS NOT INITIAL THEN | { lv_pcmt }| ELSE '' ).
+            cv_compat_chg = abap_true.
+          ENDIF.
+          RETURN.
+        ENDIF.
+
+        IF lv_tok_low = 'select'.
+          lv_seen_sel = abap_true.
+        ELSEIF lv_seen_sel = abap_true AND lv_tok_low = 'from'.
+          IF lv_ti = lv_ntoks.
+            lv_wait_src = abap_true.
+            EXIT.
+          ENDIF.
+
+          DATA(lv_src_idx)   = lv_ti + 1.
+          DATA(lv_src_tok)   = lt_ptoks[ lv_src_idx ].
+          DATA(lv_src_clean) = to_lower( lv_src_tok ).
+          REPLACE ALL OCCURRENCES OF '"' IN lv_src_clean WITH ''.
+
+          " Si ya apunta a la entidad destino (ej. nsdm_e_marc), no tocar
+          IF lv_src_clean = lv_trg_low.
+            RETURN.
+          ENDIF.
+
+          IF lv_src_clean = lv_tab_low
+             OR ( lv_prx_low IS NOT INITIAL AND lv_src_clean = lv_prx_low ).
+            " Verificar si ya tiene alias ('as <alias>') en esta misma línea o la siguiente
+            DATA(lv_has_alias) = abap_false.
+            DATA(lv_as_check)  = lv_ti + 2.
+            IF lv_as_check <= lv_ntoks AND to_lower( lt_ptoks[ lv_as_check ] ) = 'as'.
+              lv_has_alias = abap_true.
+            ELSE.
+              DATA(lv_scan_p) = lv_p_idx + 1.
+              WHILE lv_scan_p <= lv_total_prf.
+                split_inline_comment(
+                  EXPORTING iv_line = ct_prefix[ lv_scan_p ]
+                  IMPORTING ev_code = DATA(lv_nxt_pcode) ).
+                IF lv_nxt_pcode IS NOT INITIAL AND lv_nxt_pcode(1) <> '@'.
+                  DATA(lv_nxt_pl) = to_lower( lv_nxt_pcode ).
+                  IF strlen( lv_nxt_pl ) >= 4 AND lv_nxt_pl(3) = 'as '.
+                    lv_has_alias = abap_true.
+                  ENDIF.
+                  EXIT.
+                ENDIF.
+                lv_scan_p = lv_scan_p + 1.
+              ENDWHILE.
+            ENDIF.
+
+            DATA(lv_rep_str) = COND string(
+              WHEN lv_has_alias = abap_true THEN lv_trg_low
+              ELSE |{ lv_trg_low } as { lv_tab_low }| ).
+
+            " Reemplazar únicamente después de la palabra 'from' para nunca alterar
+            " el nombre de la propia vista CDS (ej. ZCDS_MARC) en la misma línea
+            DATA(lv_mask) = to_lower( lv_pcode ).
+            REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>horizontal_tab
+              IN lv_mask WITH ` `.
+            REPLACE ALL OCCURRENCES OF '{' IN lv_mask WITH ` `.
+            DATA(lv_padded) = ` ` && lv_mask && ` `.
+
+            DATA(lv_after_from_pos) = -1.
+            FIND FIRST OCCURRENCE OF ' select ' IN lv_padded MATCH OFFSET DATA(lv_sel_off).
+            IF sy-subrc = 0.
+              DATA(lv_sub_sel) = substring( val = lv_padded off = lv_sel_off ).
+              FIND FIRST OCCURRENCE OF ' from ' IN lv_sub_sel MATCH OFFSET DATA(lv_rel_fr).
+              IF sy-subrc = 0.
+                lv_after_from_pos = lv_sel_off + lv_rel_fr + 4.
+              ENDIF.
+            ELSE.
+              FIND FIRST OCCURRENCE OF ' from ' IN lv_padded MATCH OFFSET DATA(lv_fr_off).
+              IF sy-subrc = 0.
+                lv_after_from_pos = lv_fr_off + 4.
+              ENDIF.
+            ENDIF.
+
+            IF lv_after_from_pos >= 0 AND lv_after_from_pos < strlen( lv_pcode ).
+              DATA(lv_head_fr) = substring( val = lv_pcode len = lv_after_from_pos ).
+              DATA(lv_tail_fr) = substring( val = lv_pcode off = lv_after_from_pos ).
+              REPLACE FIRST OCCURRENCE OF lv_src_tok IN lv_tail_fr
+                WITH lv_rep_str IGNORING CASE.
+              DATA(lv_new_code) = lv_head_fr && lv_tail_fr.
+              <fs_pl> = lv_pind && lv_new_code &&
+                        COND string( WHEN lv_pcmt IS NOT INITIAL THEN | { lv_pcmt }| ELSE '' ).
+              cv_compat_chg = abap_true.
+            ENDIF.
+          ENDIF.
+          RETURN.
+        ENDIF.
+
+        lv_ti = lv_ti + 1.
+      ENDWHILE.
+    ENDLOOP.
+  ENDMETHOD.
+
   METHOD build_modified_cds_source.
     " Motor unificado (Vista Previa + Modificación Real):
     " 1) Elimina el bloque interno /*+[internal] { "BASEINFO": ... }*/
     " 2) Separa limpiamente cabecera, cuerpo de proyección { ... } y pie
-    " 3) Aplica bintohex(RAW <= 255), cast(QUAN/CURR/DF34_RAW as abap.dec),
-    "    comenta LRAW/RSTR no clave y comenta @Semantics del campo casteado
+    " 2B) Si P_COMP = 'X' y la tabla tiene Compatibility View (ej. MARC),
+    "     reescribe 'as select from marc' -> 'as select from nsdm_e_marc as marc'
+    "     sin tocar changeDataCapture.automatic: true
+    " 3) Aplica bintohex(RAW <= 255), cast(QUAN/CURR as abap.dec),
+    "    comenta automáticamente DF34_RAW/DF16_RAW/LRAW/RSTR no clave
+    "    y comenta @Semantics del campo casteado o comentado
     " 4) Normaliza TODAS las comas del bloque { ... }:
     "    - Cada elemento activo (1..N-1) termina exactamente con una coma ','
     "    - El último elemento activo (N) antes de '}' NO lleva coma final
@@ -1782,6 +2606,7 @@ CLASS lcl_auditor IMPLEMENTATION.
     ev_changed    = abap_false.
     ev_change_cnt = 0.
     ev_comma_cnt  = 0.
+    ev_compat_chg = abap_false.
 
     " Paso 1: Limpiar /*+[internal] { "BASEINFO" ... }*/ y saltos CR
     DATA(lv_clean_src) = strip_internal_baseinfo( iv_source ).
@@ -1988,6 +2813,25 @@ CLASS lcl_auditor IMPLEMENTATION.
       RETURN.
     ENDIF.
 
+    " Paso 2B: Si P_COMP está marcado y la tabla TRANSP tiene Compatibility View,
+    "          reemplazar 'as select from <tabla>' -> 'as select from <cds_target> as <tabla>'
+    IF p_comp = abap_true AND gt_compat IS NOT INITIAL.
+      READ TABLE gt_compat INTO DATA(ls_cmp_src)
+        WITH KEY tabname = iv_tabname BINARY SEARCH.
+      IF sy-subrc = 0
+         AND ls_cmp_src-tabclass = 'TRANSP'
+         AND ls_cmp_src-cds_target IS NOT INITIAL.
+        rewrite_compat_from_clause(
+          EXPORTING
+            iv_tabname    = iv_tabname
+            iv_proxy_obj  = ls_cmp_src-proxy_obj
+            iv_cds_target = ls_cmp_src-cds_target
+          CHANGING
+            ct_prefix     = lt_prefix
+            cv_compat_chg = ev_compat_chg ).
+      ENDIF.
+    ENDIF.
+
     " Paso 3A: Unir líneas partidas del tipo "campo \n as alias"
     DATA(lv_bi) = 1.
     WHILE lv_bi < lines( lt_body ).
@@ -2089,20 +2933,71 @@ CLASS lcl_auditor IMPLEMENTATION.
       ENDIF.
 
       " Si ya está dentro de expresión multilínea o ya tiene bintohex/cast, no envolver
+      " (EXCEPTO si era un cast previo de un campo DF34_RAW/DF16_RAW no clave: comentarlo)
       DATA(lv_low_bc) = to_lower( lv_bcode ).
       IF lv_p_run <> 0
          OR lv_low_bc CS 'bintohex('
          OR lv_low_bc CS 'cast('
          OR lv_low_bc CS 'get_numeric_value('
          OR lv_low_bc CS 'curr_to_decfloat_amount('.
+        count_code_depths(
+          EXPORTING iv_code        = lv_bcode
+          IMPORTING ev_paren_delta = DATA(lv_pd_skip) ).
+
+        DATA(lv_commented_prev_df) = abap_false.
+        IF lv_p_run = 0 AND lv_pd_skip = 0 AND lv_low_bc CS 'cast('.
+          DATA(lv_cchk) = lv_bcode.
+          REPLACE ALL OCCURRENCES OF '(' IN lv_cchk WITH ` `.
+          REPLACE ALL OCCURRENCES OF ')' IN lv_cchk WITH ` `.
+          REPLACE ALL OCCURRENCES OF ',' IN lv_cchk WITH ` `.
+          lv_cchk = condense( lv_cchk ).
+          SPLIT lv_cchk AT space INTO TABLE DATA(lt_ctoks).
+          IF lines( lt_ctoks ) >= 2 AND to_lower( lt_ctoks[ 1 ] ) = 'cast'.
+            DATA(lv_cfld) = to_upper( lt_ctoks[ 2 ] ).
+            REPLACE ALL OCCURRENCES OF '"' IN lv_cfld WITH ''.
+            IF lv_cfld CS '.'.
+              SPLIT lv_cfld AT '.' INTO DATA(lv_cpref) lv_cfld.
+            ENDIF.
+            READ TABLE gt_dd03l TRANSPORTING NO FIELDS
+              WITH KEY tabname = iv_tabname BINARY SEARCH.
+            IF sy-subrc = 0.
+              LOOP AT gt_dd03l INTO DATA(ls_gdf) FROM sy-tabix.
+                IF ls_gdf-tabname <> iv_tabname.
+                  EXIT.
+                ENDIF.
+                IF ls_gdf-fieldname = lv_cfld
+                   AND ls_gdf-keyflag <> 'X'
+                   AND ( ls_gdf-datatype = 'D34R'
+                         OR ls_gdf-datatype = 'D16R'
+                         OR ls_gdf-datatype = 'D34S'
+                         OR ls_gdf-datatype = 'D16S' ).
+                  LOOP AT lt_pending_annot INTO DATA(lv_pa_df).
+                    APPEND VALUE ty_stage_line(
+                      text = |{ lv_ind }// { trim_spaces( lv_pa_df ) }|
+                    ) TO lt_stage.
+                  ENDLOOP.
+                  CLEAR lt_pending_annot.
+                  APPEND VALUE ty_stage_line(
+                    text = |{ lv_ind }// { lv_bcode } // Excluido: { ls_gdf-datatype } no soportado en CDS/BQ|
+                  ) TO lt_stage.
+                  ev_change_cnt        = ev_change_cnt + 1.
+                  lv_commented_prev_df = abap_true.
+                  EXIT.
+                ENDIF.
+              ENDLOOP.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+        IF lv_commented_prev_df = abap_true.
+          CONTINUE.
+        ENDIF.
+
         LOOP AT lt_pending_annot INTO DATA(lv_pa_keep).
           APPEND VALUE ty_stage_line( text = lv_pa_keep ) TO lt_stage.
         ENDLOOP.
         CLEAR lt_pending_annot.
         APPEND VALUE ty_stage_line( text = lv_bline ) TO lt_stage.
-        count_code_depths(
-          EXPORTING iv_code        = lv_bcode
-          IMPORTING ev_paren_delta = DATA(lv_pd_skip) ).
         lv_p_run = lv_p_run + lv_pd_skip.
         IF lv_p_run < 0.
           lv_p_run = 0.
@@ -2165,11 +3060,15 @@ CLASS lcl_auditor IMPLEMENTATION.
         ENDLOOP.
       ENDIF.
 
-      " Si es LRAW/RSTR/RAW>255 pero es CLAVE primaria, no se puede comentar
+      " Si es LRAW/RSTR/RAW>255/DF34_RAW/DF16_RAW pero es CLAVE primaria, no comentar
       IF lv_found = abap_true
          AND lv_is_key = abap_true
          AND ( ls_match-datatype = 'LRAW'
                OR ls_match-datatype = 'RSTR'
+               OR ls_match-datatype = 'D34R'
+               OR ls_match-datatype = 'D16R'
+               OR ls_match-datatype = 'D34S'
+               OR ls_match-datatype = 'D16S'
                OR ( ls_match-datatype = 'RAW' AND CONV int4( ls_match-leng ) > 255 ) ).
         lv_found = abap_false.
       ENDIF.
@@ -2217,14 +3116,14 @@ CLASS lcl_auditor IMPLEMENTATION.
             OR ls_match-datatype = 'D16R'
             OR ls_match-datatype = 'D34S'
             OR ls_match-datatype = 'D16S'.
-          DATA(lv_df_p) = COND int4(
-            WHEN ls_match-datatype = 'D16R' OR ls_match-datatype = 'D16S'
-            THEN 16
-            ELSE 23 ).
+          DATA(lv_df_tag) = SWITCH string( ls_match-datatype
+            WHEN 'D34R' THEN 'DF34_RAW'
+            WHEN 'D16R' THEN 'DF16_RAW'
+            WHEN 'D34S' THEN 'DF34_SCL'
+            WHEN 'D16S' THEN 'DF16_SCL'
+            ELSE CONV string( ls_match-datatype ) ).
           APPEND VALUE ty_stage_line(
-            text        = |{ lv_ind }{ lv_k_txt }cast( { lv_raw_token } | &&
-                          |as abap.dec({ lv_df_p },6) ) as { lv_alias_out }{ lv_cmt_sfx }|
-            is_new_cast = abap_true
+            text = |{ lv_ind }// { lv_work } // Excluido: { lv_df_tag } no soportado en CDS/BQ|
           ) TO lt_stage.
         ELSE.
           DATA(lv_len_i) = nmax( val1 = CONV int4( ls_match-leng )
@@ -2461,7 +3360,8 @@ CLASS lcl_auditor IMPLEMENTATION.
 
     IF ev_new_source <> lv_orig_norm_str
        OR ev_change_cnt > 0
-       OR ev_comma_cnt > 0.
+       OR ev_comma_cnt > 0
+       OR ev_compat_chg = abap_true.
       ev_changed = abap_true.
     ENDIF.
   ENDMETHOD.
@@ -2469,9 +3369,9 @@ CLASS lcl_auditor IMPLEMENTATION.
   METHOD preview_cds_code.
     SELECT as4local, source
       FROM ddddlsrc
-      INTO TABLE @DATA(lt_src)
       WHERE ddlname  = @iv_ddlname
-        AND as4local IN ( 'A', 'I', 'N' ).
+        AND as4local IN ( 'A', 'I', 'N' )
+      INTO TABLE @DATA(lt_src).
 
     IF sy-subrc <> 0 OR lt_src IS INITIAL.
       MESSAGE |No se encontró código fuente en DDDDLSRC para { iv_ddlname }.|
@@ -2489,11 +3389,16 @@ CLASS lcl_auditor IMPLEMENTATION.
       IMPORTING
         et_out_lines  = DATA(lt_out)
         ev_change_cnt = DATA(lv_cnt)
-        ev_comma_cnt  = DATA(lv_cm_cnt) ).
+        ev_comma_cnt  = DATA(lv_cm_cnt)
+        ev_compat_chg = DATA(lv_cmp_chg) ).
+
+    DATA(lv_cmp_note) = COND string(
+      WHEN lv_cmp_chg = abap_true THEN 'SELECT Compat. reemplazado, '
+      ELSE '' ).
 
     cl_demo_output=>display_data(
       value = lt_out
-      name  = |Código Sugerido { iv_ddlname } ({ iv_tabname }) - { lv_cnt } cols, { lv_cm_cnt } comas corr.| ).
+      name  = |Código Sugerido { iv_ddlname } ({ iv_tabname }) - { lv_cmp_note }{ lv_cnt } cols, { lv_cm_cnt } comas| ).
   ENDMETHOD.
 
   METHOD apply_single_cds.
@@ -2501,8 +3406,9 @@ CLASS lcl_auditor IMPLEMENTATION.
           lv_tadir_name TYPE tadir-obj_name,
           lv_devclass   TYPE tadir-devclass.
 
-    ev_updated   = abap_false.
-    ev_color_col = 6.
+    ev_updated     = abap_false.
+    ev_compat_done = abap_false.
+    ev_color_col   = 6.
 
     " 1. Validaciones de seguridad: solo tablas TRANSPARENTES y vistas Z*/Y*
     IF iv_tabclass <> 'TRANSP'.
@@ -2527,9 +3433,9 @@ CLASS lcl_auditor IMPLEMENTATION.
     " 2. Consultar estado actual en DDDDLSRC y respaldar versión activa
     SELECT as4local, source
       FROM ddddlsrc
-      INTO TABLE @DATA(lt_cur)
       WHERE ddlname  = @iv_ddlname
-        AND as4local IN ( 'A', 'I', 'N' ).
+        AND as4local IN ( 'A', 'I', 'N' )
+      INTO TABLE @DATA(lt_cur).
 
     IF sy-subrc <> 0 OR lt_cur IS INITIAL.
       ev_estado_cds = 'NO EXISTE'.
@@ -2584,7 +3490,8 @@ CLASS lcl_auditor IMPLEMENTATION.
         ev_new_source = DATA(lv_new_source)
         ev_changed    = DATA(lv_changed)
         ev_change_cnt = DATA(lv_chg_cnt)
-        ev_comma_cnt  = DATA(lv_cm_cnt) ).
+        ev_comma_cnt  = DATA(lv_cm_cnt)
+        ev_compat_chg = DATA(lv_cmp_chg) ).
 
     " Si no había columnas por modificar en el código:
     IF lv_changed = abap_false.
@@ -2609,10 +3516,10 @@ CLASS lcl_auditor IMPLEMENTATION.
     lv_tadir_name = iv_ddlname.
     SELECT SINGLE devclass
       FROM tadir
-      INTO @lv_devclass
       WHERE pgmid    = 'R3TR'
         AND object   = 'DDLS'
-        AND obj_name = @lv_tadir_name.
+        AND obj_name = @lv_tadir_name
+      INTO @lv_devclass.
 
     IF sy-subrc = 0
        AND lv_devclass IS NOT INITIAL
@@ -2684,9 +3591,9 @@ CLASS lcl_auditor IMPLEMENTATION.
     " 8. Verificar en DDDDLSRC si quedó realmente ACTIVA ('A' sin 'N'/'I')
     SELECT as4local
       FROM ddddlsrc
-      INTO TABLE @DATA(lt_post)
       WHERE ddlname  = @iv_ddlname
-        AND as4local IN ( 'A', 'I', 'N' ).
+        AND as4local IN ( 'A', 'I', 'N' )
+      INTO TABLE @DATA(lt_post).
 
     DATA(lv_now_act)   = abap_false.
     DATA(lv_still_ina) = abap_false.
@@ -2702,12 +3609,24 @@ CLASS lcl_auditor IMPLEMENTATION.
       ev_estado_cds = 'ACTIVA (OK)'.
       ev_color_col  = 5.
       ev_updated    = abap_true.
+      IF lv_cmp_chg = abap_true.
+        ev_compat_done = abap_true.
+      ENDIF.
       IF lv_changed = abap_true.
+        DATA(lv_cmp_tag) = VALUE string( ).
+        IF lv_cmp_chg = abap_true.
+          READ TABLE gt_compat INTO DATA(ls_cmp_ok)
+            WITH KEY tabname = iv_tabname BINARY SEARCH.
+          IF sy-subrc = 0.
+            lv_cmp_tag = |SELECT->{ ls_cmp_ok-cds_target }, |.
+          ENDIF.
+        ENDIF.
         IF lv_cm_cnt > 0.
           ev_accion_msg =
-            |MODIF. Y ACTIVADA OK ({ lv_chg_cnt } cols, { lv_cm_cnt } comas corr.)|.
+            |MODIF. Y ACTIVADA OK ({ lv_cmp_tag }{ lv_chg_cnt } cols, { lv_cm_cnt } comas)|.
         ELSE.
-          ev_accion_msg = |MODIFICADA Y ACTIVADA OK ({ lv_chg_cnt } cols ajustadas)|.
+          ev_accion_msg =
+            |MODIFICADA Y ACTIVADA OK ({ lv_cmp_tag }{ lv_chg_cnt } cols ajustadas)|.
         ENDIF.
       ELSE.
         ev_accion_msg = 'ACTIVADA OK (código ya estaba limpio)'.
@@ -2760,6 +3679,23 @@ CLASS lcl_auditor IMPLEMENTATION.
       WHERE tabname = iv_tabname.
       <fs_sum>-estado_cds = iv_estado_cds.
       <fs_sum>-accion_cds = iv_accion_msg.
+      IF iv_compat_done = abap_true.
+        <fs_sum>-es_compat = 'SI (YA APUNTA)'.
+        DELETE <fs_sum>-t_color
+          WHERE fname = 'ES_COMPAT' OR fname = 'PROXY_OBJ' OR fname = 'CDS_TARGET'.
+        add_cell_color( EXPORTING iv_fname = 'ES_COMPAT'
+                                  iv_col   = 5
+                                  iv_int   = 0
+                        CHANGING  ct_color = <fs_sum>-t_color ).
+        add_cell_color( EXPORTING iv_fname = 'PROXY_OBJ'
+                                  iv_col   = 5
+                                  iv_int   = 0
+                        CHANGING  ct_color = <fs_sum>-t_color ).
+        add_cell_color( EXPORTING iv_fname = 'CDS_TARGET'
+                                  iv_col   = 5
+                                  iv_int   = 0
+                        CHANGING  ct_color = <fs_sum>-t_color ).
+      ENDIF.
       set_status_cell_colors(
         EXPORTING iv_estado_cds = iv_estado_cds
                   iv_accion_col = iv_color_col
@@ -2770,6 +3706,12 @@ CLASS lcl_auditor IMPLEMENTATION.
       WHERE tabname = iv_tabname.
       <fs_det>-estado_cds   = iv_estado_cds.
       <fs_det>-nota_tecnica = iv_accion_msg.
+      IF iv_compat_done = abap_true.
+        <fs_det>-es_compat = 'SI (YA APUNTA)'.
+        IF <fs_det>-categoria = 'COMPATIBILITY VIEW'.
+          <fs_det>-ubicacion_ref = |YA APUNTA A { <fs_det>-cds_target }|.
+        ENDIF.
+      ENDIF.
       set_status_cell_colors(
         EXPORTING iv_estado_cds = iv_estado_cds
                   iv_accion_col = 0
@@ -2866,14 +3808,16 @@ CLASS lcl_auditor IMPLEMENTATION.
           ev_accion_msg  = DATA(lv_msg)
           ev_color_col   = DATA(lv_col)
           ev_updated     = DATA(lv_upd)
+          ev_compat_done = DATA(lv_cmp_ok)
         CHANGING
           cv_trkorr      = gv_trkorr ).
 
       update_alv_rows_for_table(
-        iv_tabname    = ls_row-tabname
-        iv_estado_cds = lv_est
-        iv_accion_msg = lv_msg
-        iv_color_col  = lv_col ).
+        iv_tabname     = ls_row-tabname
+        iv_estado_cds  = lv_est
+        iv_accion_msg  = lv_msg
+        iv_color_col   = lv_col
+        iv_compat_done = lv_cmp_ok ).
 
       IF lv_upd = abap_true.
         lv_ok_mod = lv_ok_mod + 1.
@@ -2944,14 +3888,16 @@ CLASS lcl_auditor IMPLEMENTATION.
         ev_estado_cds  = DATA(lv_est)
         ev_accion_msg  = DATA(lv_msg)
         ev_color_col   = DATA(lv_col)
+        ev_compat_done = DATA(lv_cmp_ok2)
       CHANGING
         cv_trkorr      = gv_trkorr ).
 
     update_alv_rows_for_table(
-      iv_tabname    = iv_tabname
-      iv_estado_cds = lv_est
-      iv_accion_msg = lv_msg
-      iv_color_col  = lv_col ).
+      iv_tabname     = iv_tabname
+      iv_estado_cds  = lv_est
+      iv_accion_msg  = lv_msg
+      iv_color_col   = lv_col
+      iv_compat_done = lv_cmp_ok2 ).
 
     IF go_salv IS BOUND.
       go_salv->refresh( ).
@@ -2979,13 +3925,14 @@ INITIALIZATION.
   c_tip2  = 'Ingrese el prefijo ej. ZCDS* para asociar vistas activas e inactivas.'.
 
   txt_b3  = '3. Modo de Visualización ALV (Exportable a Excel)'.
-  c_det   = 'Vista Detallada (RAW, DF34_RAW, QUAN/CURR + Ref. SE11 + Mandante)'.
-  c_res   = 'Vista Resumen (1 fila por tabla: Mandante SI/NO + Conteos + Acción)'.
+  c_det   = 'Vista Detallada (Compat. View, RAW, DF34_RAW, QUAN/CURR + Mandante)'.
+  c_res   = 'Vista Resumen (1 fila por tabla: Compat. View + Mandante + Conteos)'.
   c_onlyx = 'No tocar/ocultar QUAN/CURR cuya moneda/unidad ya está en la misma tabla'.
 
   txt_b4  = '4. Modificación y Activación Automática de Vistas CDS (Solo TRANSP)'.
   c_read  = 'Solo Auditoría / Lectura (No modifica vistas ni pide OT)'.
   c_apply = 'Modificar y Activar Vistas CDS Masivamente con el código sugerido'.
+  c_comp  = 'Reemplazar SELECT FROM en Compatibility Views (ej. nsdm_e_marc as marc)'.
   c_actin = 'Activar también vistas CDS INACTIVAS (TRANSP) que ya estén limpias'.
   c_revrt = 'Si falla activar una vista que estaba ACTIVA, restaurar su original'.
   c_trk   = 'OT opcional (vacío = OT abierta):'.
